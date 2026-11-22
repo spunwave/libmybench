@@ -2,7 +2,7 @@
 
 ## Allowed sources
 
-Only these, kept outside this repository (`mybench-split/scratch/ppk2/ref/`):
+Only these, kept outside this repository in the project's private reference folder:
 
 | Source | Identity |
 |---|---|

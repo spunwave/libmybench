@@ -5,9 +5,10 @@ MPL-2.0 licensed (see [LICENSING.md](LICENSING.md)). It sits between the app (or
 MCP server, a web build, Python) and the device drivers. Each device family is one module under
 `drivers/`, built as its own library with its own tool.
 
-> Working name `libmybench-open` until the closed myDAQ driver, today's private `spunwave/libmybench`,
-> has been renamed `mybench-ni`. This repository then takes the `libmybench` name. Until then, don't
-> install both into the same prefix: both export a CMake package called `libmybench`.
+> Working name `libmybench-open`: the closed myDAQ driver has moved to `mybench-ni`, and this repository
+> takes the `libmybench` name once MYBENCH fetches the driver from its new place. Until the driver's
+> CMake package is renamed too, don't install both into the same prefix: both export a package called
+> `libmybench`.
 
 ## Modules
 
