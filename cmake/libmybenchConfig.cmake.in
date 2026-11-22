@@ -1,0 +1,6 @@
+# SPDX-License-Identifier: MPL-2.0
+# SPDX-FileCopyrightText: 2026 Martin Dolez
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/libmybenchTargets.cmake")
+check_required_components(libmybench)
