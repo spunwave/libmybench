@@ -22,7 +22,7 @@ PPK2, or comes back from the report's author as a written addendum.
 | Calibration and current units: metadata lines, coefficients, fallbacks, formula | `src/ppk2_meta.c` |
 | Sample framing and loss: word layout, carry, sequence, invalid range | `src/ppk2_stream.c` |
 | Board connections: gate after the shunts, disconnect before changing supply | `src/ppk2_ctl.c`, `src/ppk2_sim.c` |
-| Capture interchange: `session.raw` records | `src/ppk2_stream.c` (records) |
+| Capture interchange: `session.raw` records, `metadata.json`, the ZIP container | `src/ppk2_stream.c` (records), `src/ppk2_file.c` |
 
 Golden vectors used in `tests/test_ppk2.c`: `23 41 54 A5` → ADC 291, range 1, aux 0, sequence 21,
 logic A5; `00 00 80 3F 55 56` = 1.0 µA with D0 high; the 3.3 V example sequence

@@ -39,6 +39,10 @@ const char *ppk2_strerror(int code)
     case PPK2_ERR_NO_SPACE: return "output buffer too small";
     case PPK2_ERR_FORMAT: return "malformed input";
     case PPK2_ERR_NO_MEM: return "out of memory";
+    case PPK2_ERR_IO: return "input/output error";
+    case PPK2_ERR_UNSUPPORTED: return "not supported";
+    case PPK2_ERR_TIMEOUT: return "timed out";
+    case PPK2_ERR_DISCONNECTED: return "device disconnected";
     default: return "unknown error";
     }
 }

@@ -5,9 +5,9 @@
  * of the MPL was not distributed with this file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-/* ppk2-tool: offline PPK2 tool. No serial port yet: it works on raw byte captures (what the
- * measurement port sent: an optional metadata reply, then sample words), which makes it the
- * first hardware bring-up aid too (capture with any serial terminal, decode here). */
+/* ppk2-tool: offline PPK2 tool. It works on raw byte captures (what the measurement port sent:
+ * an optional metadata reply, then sample words), which makes it the first hardware bring-up aid
+ * too (capture with any serial terminal, decode here), and on .ppk2 capture files. */
 
 #include "libmybench/ppk2.h"
 
@@ -25,12 +25,17 @@ static void usage(void)
 {
     fputs("usage:\n"
           "  ppk2-tool sim [--seconds S] [--amps A] [--mv MV] [--drop N]   simulated capture to stdout\n"
-          "  ppk2-tool decode [--mv MV] FILE|-                               capture -> CSV on stdout\n"
+          "  ppk2-tool decode [--mv MV] [--ppk2 OUT] FILE|-                 capture -> CSV on stdout\n"
+          "                                                                  (or a .ppk2 file with --ppk2)\n"
           "  ppk2-tool meta FILE|-                                           print metadata + calibration\n"
+          "  ppk2-tool info FILE.ppk2                                        what a .ppk2 file holds\n"
+          "  ppk2-tool export FILE.ppk2                                      .ppk2 -> CSV on stdout\n"
           "\n"
           "A capture is the raw bytes from the measurement port: an optional metadata reply ending\n"
           "in END, then 32-bit sample words. --mv is the source voltage setting used for the current\n"
-          "(default: VDD from the metadata). --drop loses N samples halfway, to test gap reporting.\n",
+          "(default: VDD from the metadata). --drop loses N samples halfway, to test gap reporting.\n"
+          "In a .ppk2 file, lost samples become records with no current and every logic channel\n"
+          "\"missing\", so time stays aligned.\n",
           stderr);
 }
 
@@ -135,7 +140,7 @@ static int cmd_meta(const char *path)
     return 0;
 }
 
-static int cmd_decode(const char *path, double mv)
+static int cmd_decode(const char *path, double mv, const char *ppk2_out)
 {
     size_t len;
     uint8_t *buf = read_all(path, &len);
@@ -162,14 +167,45 @@ static int cmd_decode(const char *path, double mv)
 
     ppk2_stream *s = ppk2_stream_new();
     ppk2_stream_set_calibration(s, &cal, mv / 1000.0);
-    printf("index,time_s,current_a,range,adc,logic,flags\n");
+    ppk2_file_writer *w = NULL;
+    if (ppk2_out) {
+        const int rc = ppk2_file_create(ppk2_out, PPK2_SAMPLE_RATE, NAN, &w);
+        if (rc != PPK2_OK) {
+            fprintf(stderr, "%s: %s\n", ppk2_out, ppk2_strerror(rc));
+            ppk2_stream_free(s);
+            ppk2_meta_parser_free(p);
+            free(buf);
+            return 1;
+        }
+    } else {
+        printf("index,time_s,current_a,range,adc,logic,flags\n");
+    }
+    int write_rc = PPK2_OK;
     uint64_t index = 0;
     ppk2_sample out[4096];
     while (off < len) {
         size_t used;
         size_t n = ppk2_stream_decode(s, buf + off, len - off, &used, out, 4096);
         off += used;
-        for (size_t k = 0; k < n; k++) {
+        if (w) {
+            float ua[1];
+            uint16_t st[1];
+            for (size_t k = 0; k < n && write_rc == PPK2_OK; k++) {
+                /* Lost samples become records with no current and every channel "missing", so
+                 * the time of each record stays right. NAN (bad range, no calibration) is
+                 * stored as is. */
+                if (out[k].flags & PPK2_SAMPLE_GAP) {
+                    const float hole = NAN;
+                    for (unsigned m = 0; m < out[k].missing && write_rc == PPK2_OK; m++)
+                        write_rc = ppk2_file_append(w, &hole, NULL, 1);
+                }
+                ua[0] = (float)(out[k].current_a * 1e6);
+                st[0] = ppk2_logic_states_from_mask(out[k].logic);
+                if (write_rc == PPK2_OK)
+                    write_rc = ppk2_file_append(w, ua, st, 1);
+            }
+        }
+        for (size_t k = 0; k < n && !w; k++) {
             if (out[k].flags & PPK2_SAMPLE_GAP)
                 index += out[k].missing;
             printf("%llu,%.5f,", (unsigned long long)index, (double)index / PPK2_SAMPLE_RATE);
@@ -189,10 +225,102 @@ static int cmd_decode(const char *path, double mv)
     fprintf(stderr, "summary: words=%llu gaps=%llu missing=%llu bad_range=%llu trailing_bytes=%zu\n",
             (unsigned long long)st.words, (unsigned long long)st.gaps, (unsigned long long)st.missing,
             (unsigned long long)st.bad_range, sample_bytes % 4);
+    int rc = 0;
+    if (w) {
+        const uint64_t records = ppk2_file_written(w);
+        if (write_rc == PPK2_OK)
+            write_rc = ppk2_file_finish(w);
+        else
+            ppk2_file_abort(w);
+        if (write_rc != PPK2_OK) {
+            fprintf(stderr, "%s: %s\n", ppk2_out, ppk2_strerror(write_rc));
+            rc = 1;
+        } else {
+            fprintf(stderr, "wrote %s: %llu records\n", ppk2_out, (unsigned long long)records);
+        }
+    }
     ppk2_stream_free(s);
     ppk2_meta_parser_free(p);
     free(buf);
-    return 0;
+    return rc;
+}
+
+static ppk2_file_reader *open_ppk2(const char *path)
+{
+    ppk2_file_reader *r = NULL;
+    const int rc = ppk2_file_open(path, &r);
+    if (rc != PPK2_OK)
+        fprintf(stderr, "%s: %s\n", path, ppk2_strerror(rc));
+    return r;
+}
+
+static int cmd_info(const char *path)
+{
+    ppk2_file_reader *r = open_ppk2(path);
+    if (!r)
+        return 1;
+    const ppk2_file_info *info = ppk2_file_get_info(r);
+    printf("samples per second: %g\n", info->samples_per_second);
+    if (isnan(info->start_time_ms))
+        printf("start time: (absent)\n");
+    else
+        printf("start time: %.0f ms since 1970-01-01 UTC\n", info->start_time_ms);
+    printf("records: %llu (%.3f s)\n", (unsigned long long)info->records,
+           (double)info->records / info->samples_per_second);
+    if (info->partial_tail)
+        printf("partial record at the end: %u bytes (ignored)\n", info->partial_tail);
+    printf("minimap.raw: %s\n", info->has_minimap ? "present (ignored)" : "absent");
+
+    /* One pass for the summary: current statistics over the finite values. */
+    float ua[4096];
+    uint16_t st[4096];
+    size_t got;
+    double sum = 0.0, lo = INFINITY, hi = -INFINITY;
+    uint64_t finite = 0;
+    int rc;
+    while ((rc = ppk2_file_read(r, ua, st, 4096, &got)) == PPK2_OK && got)
+        for (size_t i = 0; i < got; i++)
+            if (isfinite(ua[i])) {
+                sum += ua[i];
+                lo = ua[i] < lo ? ua[i] : lo;
+                hi = ua[i] > hi ? ua[i] : hi;
+                finite++;
+            }
+    if (rc != PPK2_OK)
+        fprintf(stderr, "%s: %s while reading records\n", path, ppk2_strerror(rc));
+    if (finite)
+        printf("current: mean %.6g uA, min %.6g uA, max %.6g uA (%llu finite values)\n", sum / (double)finite,
+               lo, hi, (unsigned long long)finite);
+    ppk2_file_close(r);
+    return rc == PPK2_OK ? 0 : 1;
+}
+
+static int cmd_export(const char *path)
+{
+    ppk2_file_reader *r = open_ppk2(path);
+    if (!r)
+        return 1;
+    const double rate = ppk2_file_get_info(r)->samples_per_second;
+    printf("index,time_s,current_a,d0,d1,d2,d3,d4,d5,d6,d7\n");
+    static const char *const k_state[4] = {"", "0", "1", "both"};
+    float ua[4096];
+    uint16_t st[4096];
+    size_t got;
+    uint64_t index = 0;
+    int rc;
+    while ((rc = ppk2_file_read(r, ua, st, 4096, &got)) == PPK2_OK && got)
+        for (size_t i = 0; i < got; i++, index++) {
+            printf("%llu,%.6f,", (unsigned long long)index, (double)index / rate);
+            if (isfinite(ua[i]))
+                printf("%.6e", (double)ua[i] * 1e-6);
+            for (unsigned c = 0; c < 8; c++)
+                printf(",%s", k_state[ppk2_logic_state(st[i], c)]);
+            putchar('\n');
+        }
+    if (rc != PPK2_OK)
+        fprintf(stderr, "%s: %s while reading records\n", path, ppk2_strerror(rc));
+    ppk2_file_close(r);
+    return rc == PPK2_OK ? 0 : 1;
 }
 
 typedef struct {
@@ -271,7 +399,7 @@ int main(int argc, char **argv)
     const char *cmd = argv[1];
     double seconds = 1.0, amps = 1e-3, mv = NAN;
     uint64_t drop = 0;
-    const char *path = NULL;
+    const char *path = NULL, *ppk2_out = NULL;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
             seconds = atof(argv[++i]);
@@ -279,6 +407,8 @@ int main(int argc, char **argv)
             amps = atof(argv[++i]);
         else if (strcmp(argv[i], "--mv") == 0 && i + 1 < argc)
             mv = atof(argv[++i]);
+        else if (strcmp(argv[i], "--ppk2") == 0 && i + 1 < argc)
+            ppk2_out = argv[++i];
         else if (strcmp(argv[i], "--drop") == 0 && i + 1 < argc)
             drop = strtoull(argv[++i], NULL, 10);
         else if (!path && (argv[i][0] != '-' || strcmp(argv[i], "-") == 0))
@@ -291,9 +421,13 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "sim") == 0)
         return cmd_sim(seconds, amps, isnan(mv) ? 3300u : (unsigned)mv, drop);
     if (strcmp(cmd, "decode") == 0 && path)
-        return cmd_decode(path, mv);
+        return cmd_decode(path, mv, ppk2_out);
     if (strcmp(cmd, "meta") == 0 && path)
         return cmd_meta(path);
+    if (strcmp(cmd, "info") == 0 && path)
+        return cmd_info(path);
+    if (strcmp(cmd, "export") == 0 && path)
+        return cmd_export(path);
     usage();
     return 2;
 }

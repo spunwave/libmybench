@@ -40,6 +40,18 @@ if(LIBMYBENCH_BUILD_TESTS)
     enable_testing()
 endif()
 
+# Vendored miniz (MIT): ZIP for file formats. An object library, built without our warning flags
+# and linked into the modules that need it, so it is never a separate library to install.
+add_library(libmybench_miniz OBJECT third_party/miniz/miniz.c)
+target_include_directories(libmybench_miniz PRIVATE third_party/miniz)
+target_compile_definitions(libmybench_miniz PRIVATE MINIZ_NO_ZLIB_COMPATIBLE_NAMES _LARGEFILE64_SOURCE)
+set_target_properties(libmybench_miniz PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+if(MSVC)
+    target_compile_options(libmybench_miniz PRIVATE /w)
+else()
+    target_compile_options(libmybench_miniz PRIVATE -w)
+endif()
+
 if(LIBMYBENCH_DRIVER_PPK2)
     add_subdirectory(drivers/ppk2)
 endif()
