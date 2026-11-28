@@ -140,11 +140,17 @@ static void test_measure(void)
     CHECK(st.gaps == 0);
 
     ppk2_dev_close(d);
-    usleep(50 * 1000);
+    /* The bridge thread passes close's commands to the simulator on its own schedule (slow CI
+     * runners take more than 50 ms): wait up to 2 s for them to land. */
     int gate = -1, sampling = -1;
     ppk2_supply supply;
     unsigned mv = 0;
-    ppk2_sim_state(sim, &gate, &sampling, &supply, &mv);
+    for (int i = 0; i < 200; i++) {
+        ppk2_sim_state(sim, &gate, &sampling, &supply, &mv);
+        if (gate == 0 && sampling == 0)
+            break;
+        usleep(10 * 1000);
+    }
     CHECK(gate == 0);     /* close disconnects the DUT */
     CHECK(sampling == 0); /* and stops the stream */
     CHECK(supply == PPK2_SUPPLY_SOURCE && mv == 3300);
