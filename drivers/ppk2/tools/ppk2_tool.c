@@ -10,6 +10,14 @@
  * too (capture with any serial terminal, decode here), and on .ppk2 capture files. */
 
 #include "libmybench/ppk2.h"
+#include "libmybench/ppk2_dev.h"
+
+#if !defined(_WIN32)
+#include "sim_port.h"
+#include <signal.h>
+#include <unistd.h>
+#endif
+#include <time.h>
 
 #include <math.h>
 #include <stdio.h>
@@ -30,12 +38,21 @@ static void usage(void)
           "  ppk2-tool meta FILE|-                                           print metadata + calibration\n"
           "  ppk2-tool info FILE.ppk2                                        what a .ppk2 file holds\n"
           "  ppk2-tool export FILE.ppk2                                      .ppk2 -> CSV on stdout\n"
+          "  ppk2-tool list                                                  PPK2 serial ports\n"
+          "  ppk2-tool capture --port P [--ammeter] [--mv MV] [--power] [--seconds S] [--ppk2 OUT]\n"
+          "                                                                  live capture -> CSV or .ppk2\n"
+          "  ppk2-tool sim-port [--amps A]                                   simulated PPK2 on a\n"
+          "                                                                  pseudo-terminal (not Windows)\n"
           "\n"
           "A capture is the raw bytes from the measurement port: an optional metadata reply ending\n"
           "in END, then 32-bit sample words. --mv is the source voltage setting used for the current\n"
           "(default: VDD from the metadata). --drop loses N samples halfway, to test gap reporting.\n"
           "In a .ppk2 file, lost samples become records with no current and every logic channel\n"
-          "\"missing\", so time stays aligned.\n",
+          "\"missing\", so time stays aligned.\n"
+          "\n"
+          "capture: source mode at --mv (default 3300) unless --ammeter. The DUT is connected only\n"
+          "with --power, and always disconnected at the end. A PPK2 has two serial ports; which one\n"
+          "measures is not known yet: try each (the console port times out).\n",
           stderr);
 }
 
@@ -323,6 +340,142 @@ static int cmd_export(const char *path)
     return rc == PPK2_OK ? 0 : 1;
 }
 
+static int cmd_list(void)
+{
+    lmb_serial_port ports[16];
+    size_t n = 0;
+    const int rc = ppk2_dev_find(ports, 16, &n);
+    if (rc != PPK2_OK) {
+        fprintf(stderr, "list: %s\n", ppk2_dev_strerror(rc));
+        return 1;
+    }
+    if (n == 0)
+        fprintf(stderr, "no PPK2 found (USB %04x:%04x)\n", PPK2_USB_VID, PPK2_USB_PID);
+    for (size_t i = 0; i < n && i < 16; i++) {
+        printf("%s  interface %d", ports[i].path, ports[i].usb_interface);
+        if (ports[i].serial_number[0])
+            printf("  serial %s", ports[i].serial_number);
+        if (ports[i].description[0])
+            printf("  %s", ports[i].description);
+        putchar('\n');
+    }
+    return 0;
+}
+
+static volatile int g_interrupted;
+
+#if !defined(_WIN32)
+static void on_signal(int sig)
+{
+    (void)sig;
+    g_interrupted = 1;
+}
+#endif
+
+static double wall_ms(void)
+{
+    struct timespec ts;
+    timespec_get(&ts, TIME_UTC);
+    return (double)ts.tv_sec * 1000.0 + (double)(ts.tv_nsec / 1000000);
+}
+
+static int cmd_capture(const char *port, int ammeter, unsigned mv, int power, double seconds, const char *ppk2_out)
+{
+    ppk2_dev *d = NULL;
+    int rc = ppk2_dev_open(port, 0, &d);
+    if (rc != PPK2_OK) {
+        fprintf(stderr, "%s: %s\n", port, ppk2_dev_strerror(rc));
+        return 1;
+    }
+    print_fallbacks(ppk2_dev_calibration(d), stderr);
+#if !defined(_WIN32)
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+#endif
+    unsigned applied = 0;
+    rc = ppk2_dev_select_supply(d, ammeter ? PPK2_SUPPLY_AMMETER : PPK2_SUPPLY_SOURCE);
+    if (rc == PPK2_OK)
+        rc = ppk2_dev_set_voltage(d, mv, &applied); /* enters the current formula in both modes */
+    if (rc == PPK2_OK && power)
+        rc = ppk2_dev_set_power(d, 1);
+    ppk2_file_writer *w = NULL;
+    if (rc == PPK2_OK && ppk2_out)
+        rc = ppk2_file_create(ppk2_out, PPK2_SAMPLE_RATE, wall_ms(), &w);
+    if (rc == PPK2_OK)
+        rc = ppk2_dev_start(d);
+    if (rc != PPK2_OK) {
+        fprintf(stderr, "%s: %s\n", port, ppk2_dev_strerror(rc));
+        ppk2_file_abort(w);
+        ppk2_dev_close(d);
+        return 1;
+    }
+    fprintf(stderr, "%s mode, %u mV, DUT %s; capturing %g s (Ctrl-C stops)\n", ammeter ? "ammeter" : "source",
+            applied, power ? "connected" : "not connected", seconds);
+    if (!w)
+        printf("index,time_s,current_a,range,logic,flags\n");
+    const uint64_t total = (uint64_t)(seconds * PPK2_SAMPLE_RATE + 0.5);
+    uint64_t index = 0, received = 0;
+    ppk2_sample s[4096];
+    int idle = 0;
+    while (received < total && !g_interrupted && rc == PPK2_OK) {
+        size_t got = 0;
+        size_t want = total - received < 4096 ? (size_t)(total - received) : 4096;
+        rc = ppk2_dev_read(d, s, want, 200, &got);
+        if (rc != PPK2_OK)
+            break;
+        if (got == 0 && ++idle >= 10) {
+            rc = PPK2_ERR_TIMEOUT; /* 2 s without a sample */
+            break;
+        }
+        if (got)
+            idle = 0;
+        for (size_t k = 0; k < got && rc == PPK2_OK; k++) {
+            if (s[k].flags & PPK2_SAMPLE_GAP) {
+                index += s[k].missing;
+                const float hole = NAN;
+                for (unsigned m = 0; w && m < s[k].missing && rc == PPK2_OK; m++)
+                    rc = ppk2_file_append(w, &hole, NULL, 1);
+            }
+            if (w) {
+                const float ua = (float)(s[k].current_a * 1e6);
+                const uint16_t st = ppk2_logic_states_from_mask(s[k].logic);
+                if (rc == PPK2_OK)
+                    rc = ppk2_file_append(w, &ua, &st, 1);
+            } else {
+                printf("%llu,%.5f,", (unsigned long long)index, (double)index / PPK2_SAMPLE_RATE);
+                if (!isnan(s[k].current_a))
+                    printf("%.6e", s[k].current_a);
+                printf(",%u,0x%02X,%s%s\n", s[k].range, s[k].logic, s[k].flags & PPK2_SAMPLE_GAP ? "gap " : "",
+                       s[k].flags & PPK2_SAMPLE_BAD_RANGE ? "bad-range" : "");
+            }
+            index++;
+        }
+        received += got;
+    }
+    ppk2_stream_stats st;
+    ppk2_dev_stats(d, &st);
+    ppk2_dev_close(d); /* stops and disconnects the DUT whatever happened */
+    int status = 0;
+    if (rc != PPK2_OK) {
+        fprintf(stderr, "capture: %s\n", ppk2_dev_strerror(rc));
+        status = 1;
+    }
+    if (w) {
+        const uint64_t n = ppk2_file_written(w);
+        const int frc = ppk2_file_finish(w);
+        if (frc != PPK2_OK) {
+            fprintf(stderr, "%s: %s\n", ppk2_out, ppk2_strerror(frc));
+            status = 1;
+        } else {
+            fprintf(stderr, "wrote %s: %llu records\n", ppk2_out, (unsigned long long)n);
+        }
+    }
+    fprintf(stderr, "summary: words=%llu gaps=%llu missing=%llu bad_range=%llu%s\n", (unsigned long long)st.words,
+            (unsigned long long)st.gaps, (unsigned long long)st.missing, (unsigned long long)st.bad_range,
+            g_interrupted ? " (interrupted)" : "");
+    return status;
+}
+
 typedef struct {
     double amps;
 } sim_load;
@@ -390,6 +543,33 @@ static int cmd_sim(double seconds, double amps, unsigned mv, uint64_t drop)
     return 0;
 }
 
+#if !defined(_WIN32)
+static int cmd_sim_port(double amps)
+{
+    ppk2_sim *sim = ppk2_sim_new(NULL);
+    static sim_load load;
+    load.amps = amps;
+    ppk2_sim_set_load(sim, sim_current, NULL, &load);
+    char path[256];
+    sim_port *port = NULL;
+    if (!sim || sim_port_start(sim, path, sizeof path, &port) != 0) {
+        perror("sim-port");
+        ppk2_sim_free(sim);
+        return 1;
+    }
+    signal(SIGINT, on_signal);
+    signal(SIGTERM, on_signal);
+    printf("%s\n", path);
+    fflush(stdout);
+    fprintf(stderr, "simulated PPK2 (%g A load) on %s; Ctrl-C stops\n", amps, path);
+    while (!g_interrupted)
+        pause();
+    sim_port_stop(port);
+    ppk2_sim_free(sim);
+    return 0;
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -399,7 +579,8 @@ int main(int argc, char **argv)
     const char *cmd = argv[1];
     double seconds = 1.0, amps = 1e-3, mv = NAN;
     uint64_t drop = 0;
-    const char *path = NULL, *ppk2_out = NULL;
+    const char *path = NULL, *ppk2_out = NULL, *port = NULL;
+    int ammeter = 0, power = 0;
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--seconds") == 0 && i + 1 < argc)
             seconds = atof(argv[++i]);
@@ -407,6 +588,12 @@ int main(int argc, char **argv)
             amps = atof(argv[++i]);
         else if (strcmp(argv[i], "--mv") == 0 && i + 1 < argc)
             mv = atof(argv[++i]);
+        else if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
+            port = argv[++i];
+        else if (strcmp(argv[i], "--ammeter") == 0)
+            ammeter = 1;
+        else if (strcmp(argv[i], "--power") == 0)
+            power = 1;
         else if (strcmp(argv[i], "--ppk2") == 0 && i + 1 < argc)
             ppk2_out = argv[++i];
         else if (strcmp(argv[i], "--drop") == 0 && i + 1 < argc)
@@ -424,6 +611,14 @@ int main(int argc, char **argv)
         return cmd_decode(path, mv, ppk2_out);
     if (strcmp(cmd, "meta") == 0 && path)
         return cmd_meta(path);
+    if (strcmp(cmd, "list") == 0)
+        return cmd_list();
+    if (strcmp(cmd, "capture") == 0 && port)
+        return cmd_capture(port, ammeter, isnan(mv) ? 3300u : (unsigned)mv, power, seconds, ppk2_out);
+#if !defined(_WIN32)
+    if (strcmp(cmd, "sim-port") == 0)
+        return cmd_sim_port(amps);
+#endif
     if (strcmp(cmd, "info") == 0 && path)
         return cmd_info(path);
     if (strcmp(cmd, "export") == 0 && path)

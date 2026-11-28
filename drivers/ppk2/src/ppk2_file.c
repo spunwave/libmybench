@@ -316,6 +316,8 @@ int ppk2_file_format_metadata(char *buf, size_t cap, double samples_per_second, 
 
 struct ppk2_file_reader {
     mz_zip_archive zip;
+    const uint8_t *mem; /* ppk2_file_open_mem: the caller's buffer */
+    size_t mem_len;
     mz_zip_reader_extract_iter_state *iter;
     ppk2_file_info info;
     uint64_t remaining; /* complete records not yet returned */
@@ -351,6 +353,21 @@ static int reader_init(ppk2_file_reader *r)
     return PPK2_OK;
 }
 
+/* Memory input goes through a read callback rather than mz_zip_reader_init_mem: miniz 3.1.2's
+ * memory mode never runs out of input while inflating (comp_remaining is not counted down), so
+ * a damaged deflate stream would loop forever. The callback path ends with an error instead. */
+static size_t mem_read(void *opaque, mz_uint64 ofs, void *buf, size_t n)
+{
+    const ppk2_file_reader *r = opaque;
+    if (ofs >= r->mem_len)
+        return 0;
+    const size_t avail = (size_t)(r->mem_len - ofs);
+    if (n > avail)
+        n = avail;
+    memcpy(buf, r->mem + ofs, n);
+    return n;
+}
+
 static int reader_open(ppk2_file_reader **out, const char *path, const void *data, size_t len)
 {
     if (!out || (!path && !data))
@@ -359,7 +376,16 @@ static int reader_open(ppk2_file_reader **out, const char *path, const void *dat
     ppk2_file_reader *r = calloc(1, sizeof *r);
     if (!r)
         return PPK2_ERR_NO_MEM;
-    mz_bool ok = path ? mz_zip_reader_init_file(&r->zip, path, 0) : mz_zip_reader_init_mem(&r->zip, data, len, 0);
+    mz_bool ok;
+    if (path) {
+        ok = mz_zip_reader_init_file(&r->zip, path, 0);
+    } else {
+        r->mem = data;
+        r->mem_len = len;
+        r->zip.m_pRead = mem_read;
+        r->zip.m_pIO_opaque = r;
+        ok = mz_zip_reader_init(&r->zip, len, 0);
+    }
     if (!ok) {
         const mz_zip_error e = mz_zip_get_last_error(&r->zip);
         free(r);

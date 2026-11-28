@@ -142,6 +142,12 @@ LMB_API int ppk2_ctl_shutdown(ppk2_ctl *ctl, ppk2_tx *tx);
 /** A write failed or its result is unknown: assume nothing about the gate or the stream. */
 LMB_API void ppk2_ctl_invalidate(ppk2_ctl *ctl);
 
+/**
+ * Length of the command that starts with this opcode (1-6 bytes), or 0 for an unknown opcode.
+ * For whoever receives commands as a byte stream (a simulated port) and must split it again.
+ */
+LMB_API size_t ppk2_command_length(uint8_t opcode);
+
 LMB_API ppk2_supply ppk2_ctl_supply(const ppk2_ctl *ctl);
 LMB_API int ppk2_ctl_power_on(const ppk2_ctl *ctl);  /**< 1 on, 0 off, -1 unknown */
 LMB_API int ppk2_ctl_sampling(const ppk2_ctl *ctl);  /**< 1 sampling, 0 idle, -1 unknown */
@@ -386,6 +392,8 @@ LMB_API size_t ppk2_sim_read(ppk2_sim *sim, uint8_t *out, size_t cap, uint64_t w
 LMB_API void ppk2_sim_drop(ppk2_sim *sim, uint64_t n);
 /** Index of the next sample. */
 LMB_API uint64_t ppk2_sim_index(const ppk2_sim *sim);
+/** What the simulated unit was last told: gate (DUT power), sampling, supply and voltage in mV. */
+LMB_API void ppk2_sim_state(const ppk2_sim *sim, int *gate, int *sampling, ppk2_supply *supply, unsigned *mv);
 /** The current the simulated wire actually encodes for a load (after ADC rounding), for tests. */
 LMB_API double ppk2_sim_quantize(const ppk2_sim *sim, double amps, unsigned *range_out);
 

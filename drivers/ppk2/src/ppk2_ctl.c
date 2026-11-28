@@ -47,6 +47,25 @@ const char *ppk2_strerror(int code)
     }
 }
 
+size_t ppk2_command_length(uint8_t opcode)
+{
+    switch (opcode) {
+    case 0x19: /* metadata */
+    case 0x06: /* start */
+    case 0x07: /* stop */
+        return 1;
+    case 0x11: /* supply */
+    case 0x0C: /* DUT power */
+        return 2;
+    case 0x0D: /* voltage */
+        return 3;
+    case 0x25: /* user gain */
+        return 6;
+    default:
+        return 0;
+    }
+}
+
 static void push(ppk2_tx *tx, uint8_t len, uint8_t b0, uint8_t b1, uint8_t b2)
 {
     /* Every public call pushes at most PPK2_TX_MAX frames. */

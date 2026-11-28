@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: MPL-2.0
 # SPDX-FileCopyrightText: 2026 Martin Dolez
 
+set(_ppk2_dev_sources)
+if(TARGET libmybench_serial)
+    set(_ppk2_dev_sources src/ppk2_dev.c)   # the device layer needs the serial transport
+endif()
 libmybench_module(ppk2 SOURCES
+    ${_ppk2_dev_sources}
     src/ppk2_ctl.c
     src/ppk2_file.c
     src/ppk2_meta.c
     src/ppk2_sim.c
     src/ppk2_stream.c
     src/text.c)
+if(TARGET libmybench_serial)
+    target_link_libraries(libmybench_ppk2 PUBLIC libmybench::serial)
+endif()
 # .ppk2 archives: the vendored miniz, compiled into this library (no zlib-compatible names).
 target_sources(libmybench_ppk2 PRIVATE $<TARGET_OBJECTS:libmybench_miniz>)
 target_include_directories(libmybench_ppk2 PRIVATE ${PROJECT_SOURCE_DIR}/third_party/miniz)
@@ -24,16 +32,34 @@ if(LIBMYBENCH_BUILD_TESTS)
     # library's is hidden in shared builds).
     add_executable(ppk2_file_tests tests/test_ppk2_file.c $<TARGET_OBJECTS:libmybench_miniz>)
     target_include_directories(ppk2_file_tests PRIVATE ${PROJECT_SOURCE_DIR}/third_party/miniz)
+    # Its own folder: ppk2_tool_roundtrip writes roundtrip.ppk2 too, and ctest -j runs both at once.
+    file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/file-tests)
     target_compile_definitions(ppk2_file_tests PRIVATE MINIZ_NO_ZLIB_COMPATIBLE_NAMES
-        PPK2_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}")
+        PPK2_TEST_TMPDIR="${CMAKE_CURRENT_BINARY_DIR}/file-tests")
     target_link_libraries(ppk2_file_tests PRIVATE libmybench::ppk2)
     libmybench_warnings(ppk2_file_tests)
     add_test(NAME ppk2_file COMMAND ppk2_file_tests)
+
+    # The device layer against a simulated PPK2 behind a pseudo-terminal (POSIX only).
+    if(UNIX AND TARGET libmybench_serial)
+        find_package(Threads REQUIRED)
+        add_executable(ppk2_dev_tests tests/test_ppk2_dev.c tools/sim_port.c)
+        target_include_directories(ppk2_dev_tests PRIVATE tools)
+        target_link_libraries(ppk2_dev_tests PRIVATE libmybench::ppk2 Threads::Threads)
+        libmybench_warnings(ppk2_dev_tests)
+        add_test(NAME ppk2_dev COMMAND ppk2_dev_tests)
+        set_tests_properties(ppk2_dev PROPERTIES TIMEOUT 60)
+    endif()
 endif()
 
 if(LIBMYBENCH_BUILD_TOOLS)
     add_executable(ppk2-tool tools/ppk2_tool.c)
     target_link_libraries(ppk2-tool PRIVATE libmybench::ppk2)
+    if(UNIX)
+        find_package(Threads REQUIRED)
+        target_sources(ppk2-tool PRIVATE tools/sim_port.c)
+        target_link_libraries(ppk2-tool PRIVATE Threads::Threads)
+    endif()
     libmybench_warnings(ppk2-tool)
     install(TARGETS ppk2-tool RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
     if(LIBMYBENCH_BUILD_TESTS)

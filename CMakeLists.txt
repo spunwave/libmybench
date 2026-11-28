@@ -11,6 +11,7 @@ set(CMAKE_AUTORCC OFF)
 set(CMAKE_AUTOUIC OFF)
 
 option(LIBMYBENCH_DRIVER_PPK2 "Build the Nordic PPK2 driver" ON)
+option(LIBMYBENCH_TRANSPORT_SERIAL "Build the serial-port transport (needed by the PPK2 device layer)" ON)
 option(LIBMYBENCH_BUILD_TESTS "Build the unit tests" ON)
 option(LIBMYBENCH_BUILD_TOOLS "Build the command-line tools" ON)
 option(LIBMYBENCH_WERROR "Treat warnings as errors" OFF)
@@ -25,6 +26,11 @@ set(CMAKE_C_VISIBILITY_PRESET hidden)
 
 include(GNUInstallDirs)
 include(cmake/LibmybenchModule.cmake)
+
+if(LIBMYBENCH_FUZZ)
+    # Coverage feedback from the library code itself, not only from the fuzz harnesses.
+    add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
 
 # Headers shared by every module (export macro).
 add_library(libmybench_base INTERFACE)
@@ -52,6 +58,9 @@ else()
     target_compile_options(libmybench_miniz PRIVATE -w)
 endif()
 
+if(LIBMYBENCH_TRANSPORT_SERIAL)
+    add_subdirectory(transports/serial)
+endif()
 if(LIBMYBENCH_DRIVER_PPK2)
     add_subdirectory(drivers/ppk2)
 endif()
