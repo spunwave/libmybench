@@ -22,7 +22,8 @@ PPK2, or comes back from the report's author as a written addendum.
 | Calibration and current units: metadata lines, coefficients, fallbacks, formula | `src/ppk2_meta.c` |
 | Sample framing and loss: word layout, carry, sequence, invalid range | `src/ppk2_stream.c` |
 | Board connections: gate after the shunts, disconnect before changing supply | `src/ppk2_ctl.c`, `src/ppk2_sim.c` |
-| Capture interchange: `session.raw` records | `src/ppk2_stream.c` (records) |
+| Capture interchange: `session.raw` records, `metadata.json`, the ZIP container | `src/ppk2_stream.c` (records), `src/ppk2_file.c` |
+| Measurement connection: USB ids, serial settings, open/stop/drain order | `transports/serial`, `src/ppk2_dev.c` |
 
 Golden vectors used in `tests/test_ppk2.c`: `23 41 54 A5` → ADC 291, range 1, aux 0, sequence 21,
 logic A5; `00 00 80 3F 55 56` = 1.0 µA with D0 high; the 3.3 V example sequence
@@ -32,7 +33,11 @@ logic A5; `00 00 80 3F 55 56` = 1.0 µA with D0 high; the 3.3 V example sequence
 
 - User gain (`25 …`) is not sent: the report suspects a firmware payload-length mismatch.
   Calibration is applied on the host. The simulator accepts and ignores it.
-- The measurement port is chosen by USB interface number, not "first listed" (transport, not yet written).
+- A PPK2 shows two serial ports. `ppk2_dev_find()` and `ppk2-tool list` return both with their USB interface
+  number instead of guessing; until question 1 is settled the caller picks one, and a port that does not
+  answer the metadata request fails with `PPK2_ERR_TIMEOUT` within 3 s.
+- Serial settings from the report (115200 baud, raw, DTR asserted) live in `transports/serial`, which knows
+  nothing about the PPK2; `src/ppk2_dev.c` adds the command framing and timing on top.
 - `ppk2_ctl` refuses a metadata request until the stream is known to be stopped, so a unit left
   streaming by another program can't corrupt the reply.
 - Numbers in the metadata are parsed without the C locale (a French or Dutch desktop would

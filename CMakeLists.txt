@@ -11,6 +11,7 @@ set(CMAKE_AUTORCC OFF)
 set(CMAKE_AUTOUIC OFF)
 
 option(LIBMYBENCH_DRIVER_PPK2 "Build the Nordic PPK2 driver" ON)
+option(LIBMYBENCH_TRANSPORT_SERIAL "Build the serial-port transport (needed by the PPK2 device layer)" ON)
 option(LIBMYBENCH_BUILD_TESTS "Build the unit tests" ON)
 option(LIBMYBENCH_BUILD_TOOLS "Build the command-line tools" ON)
 option(LIBMYBENCH_WERROR "Treat warnings as errors" OFF)
@@ -24,7 +25,19 @@ endif()
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 
 include(GNUInstallDirs)
+
+# Windows finds DLLs next to the executable, not through an rpath: with BUILD_SHARED_LIBS the
+# tests and tools would miss the libraries built in other folders, and the "DLL not found" dialog
+# blocks a headless run forever. Put every executable and DLL of this build in one bin/ folder.
+if(WIN32 AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+endif()
 include(cmake/LibmybenchModule.cmake)
+
+if(LIBMYBENCH_FUZZ)
+    # Coverage feedback from the library code itself, not only from the fuzz harnesses.
+    add_compile_options(-fsanitize=fuzzer-no-link)
+endif()
 
 # Headers shared by every module (export macro).
 add_library(libmybench_base INTERFACE)
@@ -40,6 +53,21 @@ if(LIBMYBENCH_BUILD_TESTS)
     enable_testing()
 endif()
 
+# Vendored miniz (MIT): ZIP for file formats. An object library, built without our warning flags
+# and linked into the modules that need it, so it is never a separate library to install.
+add_library(libmybench_miniz OBJECT third_party/miniz/miniz.c)
+target_include_directories(libmybench_miniz PRIVATE third_party/miniz)
+target_compile_definitions(libmybench_miniz PRIVATE MINIZ_NO_ZLIB_COMPATIBLE_NAMES _LARGEFILE64_SOURCE)
+set_target_properties(libmybench_miniz PROPERTIES POSITION_INDEPENDENT_CODE ON C_VISIBILITY_PRESET hidden)
+if(MSVC)
+    target_compile_options(libmybench_miniz PRIVATE /w)
+else()
+    target_compile_options(libmybench_miniz PRIVATE -w)
+endif()
+
+if(LIBMYBENCH_TRANSPORT_SERIAL)
+    add_subdirectory(transports/serial)
+endif()
 if(LIBMYBENCH_DRIVER_PPK2)
     add_subdirectory(drivers/ppk2)
 endif()

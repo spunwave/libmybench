@@ -17,7 +17,7 @@ jobs:
       - name: Build
         run: cmake --build build --config Release -j 4
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        run: ctest --test-dir build -C Release --output-on-failure --timeout 300
   sanitize-fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -27,8 +27,9 @@ jobs:
           CC=clang cmake -S . -B build -DLIBMYBENCH_FUZZ=ON -DLIBMYBENCH_WERROR=ON \
             "-DCMAKE_C_FLAGS=-fsanitize=address,undefined -fno-sanitize-recover=all"
           cmake --build build -j 4
-          ctest --test-dir build --output-on-failure
+          ctest --test-dir build --output-on-failure --timeout 300
       - name: Fuzz 60 s each
         run: |
           ./build/drivers/ppk2/ppk2_fuzz_meta -max_total_time=60 -max_len=8192
           ./build/drivers/ppk2/ppk2_fuzz_stream -max_total_time=60 -max_len=8192
+          ./build/drivers/ppk2/ppk2_fuzz_file -max_total_time=60 -max_len=65536

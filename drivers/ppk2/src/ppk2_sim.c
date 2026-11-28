@@ -231,3 +231,17 @@ void ppk2_sim_drop(ppk2_sim *sim, uint64_t n)
 }
 
 uint64_t ppk2_sim_index(const ppk2_sim *sim) { return sim->index; }
+
+void ppk2_sim_state(const ppk2_sim *sim, int *gate, int *sampling, ppk2_supply *supply, unsigned *mv)
+{
+    if (!sim)
+        return;
+    if (gate)
+        *gate = sim->gate;
+    if (sampling)
+        *sampling = sim->sampling;
+    if (supply)
+        *supply = sim->supply;
+    if (mv)
+        *mv = sim->mv;
+}

@@ -25,6 +25,8 @@
  *                     gap detection, current in amperes.
  *   ppk2_record_*     the 6-byte records of a .ppk2 capture's session.raw.
  *   ppk2_sim          a simulated PPK2 that accepts the same commands and produces real wire bytes.
+ *   ppk2_file_*       .ppk2 capture files (ZIP: metadata.json + session.raw), read and written.
+ *                     Unlike the rest, these do file I/O (stdio), or read from memory.
  *
  * Errors: functions returning int return PPK2_OK (0) or a negative ppk2_status.
  *
@@ -59,7 +61,11 @@ typedef enum ppk2_status {
     PPK2_ERR_STATE = -2,       /**< not allowed in the current state (see ppk2_ctl) */
     PPK2_ERR_NO_SPACE = -3,    /**< the output buffer is too small */
     PPK2_ERR_FORMAT = -4,      /**< malformed input */
-    PPK2_ERR_NO_MEM = -5       /**< allocation failed */
+    PPK2_ERR_NO_MEM = -5,      /**< allocation failed */
+    PPK2_ERR_IO = -6,          /**< a file or port could not be opened, read or written */
+    PPK2_ERR_UNSUPPORTED = -7, /**< well-formed but not supported (e.g. another .ppk2 version) */
+    PPK2_ERR_TIMEOUT = -8,     /**< the device did not answer in time */
+    PPK2_ERR_DISCONNECTED = -9 /**< the device went away */
 } ppk2_status;
 
 /** Description of a ppk2_status (static string, never NULL). */
@@ -135,6 +141,12 @@ LMB_API int ppk2_ctl_shutdown(ppk2_ctl *ctl, ppk2_tx *tx);
 
 /** A write failed or its result is unknown: assume nothing about the gate or the stream. */
 LMB_API void ppk2_ctl_invalidate(ppk2_ctl *ctl);
+
+/**
+ * Length of the command that starts with this opcode (1-6 bytes), or 0 for an unknown opcode.
+ * For whoever receives commands as a byte stream (a simulated port) and must split it again.
+ */
+LMB_API size_t ppk2_command_length(uint8_t opcode);
 
 LMB_API ppk2_supply ppk2_ctl_supply(const ppk2_ctl *ctl);
 LMB_API int ppk2_ctl_power_on(const ppk2_ctl *ctl);  /**< 1 on, 0 off, -1 unknown */
@@ -290,6 +302,66 @@ LMB_API uint16_t ppk2_logic_states_from_mask(uint8_t mask);
 LMB_API unsigned ppk2_logic_state(uint16_t states, unsigned channel);
 
 /* ------------------------------------------------------------------------------------------ */
+/* .ppk2 capture files (format version 2)                                                       */
+
+/*
+ * A ZIP archive holding metadata.json ({"formatVersion": 2, "metadata": {"samplesPerSecond": ...,
+ * "startSystemTime": ...}}) and session.raw (the records above, record i at time
+ * i / samplesPerSecond). minimap.raw, the desktop app's overview, is neither read nor written:
+ * its layout is not documented in the clean-room report. Whether the desktop app opens a file
+ * without it is an open question (drivers/ppk2/CLEANROOM.md).
+ */
+
+typedef struct ppk2_file_info {
+    double samples_per_second;
+    double start_time_ms;  /**< startSystemTime (Unix epoch, ms), NAN when absent */
+    uint64_t records;      /**< complete records in session.raw */
+    unsigned partial_tail; /**< bytes after the last complete record (0-5), not returned */
+    int has_minimap;       /**< the archive has a minimap.raw (ignored) */
+} ppk2_file_info;
+
+typedef struct ppk2_file_reader ppk2_file_reader;
+
+/** Open a capture. PPK2_ERR_IO (can't open), _FORMAT (not a .ppk2), _UNSUPPORTED (formatVersion != 2). */
+LMB_API int ppk2_file_open(const char *path, ppk2_file_reader **out);
+/** Same, from a file in memory; data must stay valid until ppk2_file_close. */
+LMB_API int ppk2_file_open_mem(const void *data, size_t len, ppk2_file_reader **out);
+LMB_API const ppk2_file_info *ppk2_file_get_info(const ppk2_file_reader *r);
+/**
+ * The next records, in order: up to cap of them into current_ua and/or logic_states (either
+ * may be NULL). *got is 0 at the end. PPK2_ERR_FORMAT if the archive is damaged (CRC errors are
+ * not detected until the whole entry has been read).
+ */
+LMB_API int ppk2_file_read(ppk2_file_reader *r, float *current_ua, uint16_t *logic_states, size_t cap,
+                           size_t *got);
+LMB_API void ppk2_file_close(ppk2_file_reader *r);
+
+typedef struct ppk2_file_writer ppk2_file_writer;
+
+/**
+ * Start a capture file at path. Records go to "<path>.part" while recording, and
+ * ppk2_file_finish writes the archive. start_time_ms: Unix epoch in ms, or NAN to leave it out.
+ */
+LMB_API int ppk2_file_create(const char *path, double samples_per_second, double start_time_ms,
+                             ppk2_file_writer **out);
+/** Append n records. logic_states may be NULL (all channels "missing"). */
+LMB_API int ppk2_file_append(ppk2_file_writer *w, const float *current_ua, const uint16_t *logic_states, size_t n);
+/** Records appended so far. */
+LMB_API uint64_t ppk2_file_written(const ppk2_file_writer *w);
+/** Write the archive, remove the .part file and free w (also on error). */
+LMB_API int ppk2_file_finish(ppk2_file_writer *w);
+/** Drop the capture: remove the .part file and free w. */
+LMB_API void ppk2_file_abort(ppk2_file_writer *w);
+
+/**
+ * metadata.json by itself, for other containers and for tests. parse: PPK2_ERR_FORMAT (not JSON,
+ * or formatVersion / samplesPerSecond missing or invalid), PPK2_ERR_UNSUPPORTED (another version).
+ * format: returns the length written (without the terminating NUL) or a negative ppk2_status.
+ */
+LMB_API int ppk2_file_parse_metadata(const char *text, size_t len, ppk2_file_info *info);
+LMB_API int ppk2_file_format_metadata(char *buf, size_t cap, double samples_per_second, double start_time_ms);
+
+/* ------------------------------------------------------------------------------------------ */
 /* Simulated PPK2                                                                             */
 
 typedef struct ppk2_sim ppk2_sim;
@@ -320,6 +392,8 @@ LMB_API size_t ppk2_sim_read(ppk2_sim *sim, uint8_t *out, size_t cap, uint64_t w
 LMB_API void ppk2_sim_drop(ppk2_sim *sim, uint64_t n);
 /** Index of the next sample. */
 LMB_API uint64_t ppk2_sim_index(const ppk2_sim *sim);
+/** What the simulated unit was last told: gate (DUT power), sampling, supply and voltage in mV. */
+LMB_API void ppk2_sim_state(const ppk2_sim *sim, int *gate, int *sampling, ppk2_supply *supply, unsigned *mv);
 /** The current the simulated wire actually encodes for a load (after ADC rounding), for tests. */
 LMB_API double ppk2_sim_quantize(const ppk2_sim *sim, double amps, unsigned *range_out);
 
