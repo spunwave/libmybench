@@ -8,13 +8,17 @@ endif()
 libmybench_module(ppk2 SOURCES
     ${_ppk2_dev_sources}
     src/ppk2_ctl.c
+    src/ppk2_family.c
     src/ppk2_file.c
     src/ppk2_meta.c
     src/ppk2_sim.c
     src/ppk2_stream.c
     src/text.c)
+# The device-model adapter (ppk2_family.c): facets over ppk2_dev, and the simulator.
+target_link_libraries(libmybench_ppk2 PUBLIC libmybench::core)
 if(TARGET libmybench_serial)
     target_link_libraries(libmybench_ppk2 PUBLIC libmybench::serial)
+    target_compile_definitions(libmybench_ppk2 PRIVATE LMB_PPK2_HAVE_SERIAL)
 endif()
 # .ppk2 archives: the vendored miniz, compiled into this library (no zlib-compatible names).
 target_sources(libmybench_ppk2 PRIVATE $<TARGET_OBJECTS:libmybench_miniz>)
@@ -50,6 +54,16 @@ if(LIBMYBENCH_BUILD_TESTS)
         add_test(NAME ppk2_dev COMMAND ppk2_dev_tests)
         set_tests_properties(ppk2_dev PROPERTIES TIMEOUT 60)
     endif()
+    # The family adapter on the simulator: facets, streaming, error paths.
+    add_executable(ppk2_family_tests tests/test_ppk2_family.c)
+    target_link_libraries(ppk2_family_tests PRIVATE libmybench::ppk2)
+    if(UNIX)
+        find_package(Threads REQUIRED)
+        target_link_libraries(ppk2_family_tests PRIVATE Threads::Threads)
+    endif()
+    libmybench_warnings(ppk2_family_tests)
+    add_test(NAME ppk2_family COMMAND ppk2_family_tests)
+    set_tests_properties(ppk2_family PROPERTIES TIMEOUT 60)
 endif()
 
 if(LIBMYBENCH_BUILD_TOOLS)
