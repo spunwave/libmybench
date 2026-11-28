@@ -7,6 +7,10 @@
 /* The PPK2 family of the device model: facets over ppk2_dev (hardware) or over the in-process
  * simulator, with one sample ring shared by the stream facets. See ppk2_family.h. */
 
+#if defined(_MSC_VER) && !defined(_CRT_SECURE_NO_WARNINGS)
+#define _CRT_SECURE_NO_WARNINGS /* getenv, for LMB_PPK2_SIMULATORS */
+#endif
+
 #include "libmybench/ppk2_family.h"
 
 #include "libmybench/driver.h"
@@ -859,9 +863,26 @@ static int fam_enumerate(void *user, uint32_t flags, lmb_device_info *out, size_
     (void)user;
     *count = 0;
     if (!(flags & LMB_ENUM_NO_SIMULATED)) {
-        if (*count < cap)
-            sim_info(&out[*count], SIM_ID);
-        (*count)++;
+        /* "sim:ppk2", then "sim:ppk2:2", ... when LMB_PPK2_SIMULATORS asks for more (demos, tests of
+         * an application with several devices). */
+        long sims = 1;
+        const char *env = getenv("LMB_PPK2_SIMULATORS");
+        if (env && *env) {
+            char *end = NULL;
+            const long v = strtol(env, &end, 10);
+            if (end != env && v >= 1 && v <= 8)
+                sims = v;
+        }
+        for (long i = 1; i <= sims; i++) {
+            char id[sizeof SIM_ID + 8];
+            if (i == 1)
+                snprintf(id, sizeof id, "%s", SIM_ID);
+            else
+                snprintf(id, sizeof id, "%s:%ld", SIM_ID, i);
+            if (*count < cap)
+                sim_info(&out[*count], id);
+            (*count)++;
+        }
     }
     #ifdef LMB_PPK2_HAVE_SERIAL
     if (!(flags & LMB_ENUM_ONLY_SIMULATED))

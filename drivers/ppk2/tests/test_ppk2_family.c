@@ -8,6 +8,10 @@
  * facets, power order, streaming (mean current, no gaps, aligned logic), gaps, a slow reader,
  * a lost device, and two threads on one device. Runs in real time (100 kS/s). */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L /* setenv, unsetenv under -std=c11 */
+#endif
+
 #include "libmybench/device.h"
 #include "libmybench/facets.h"
 #include "libmybench/ppk2_family.h"
@@ -104,6 +108,25 @@ static void test_registry(void)
     CHECK(strcmp(info.transport, "sim") == 0);
     CHECK(info.facets == (LMB_FACET_BIT(LMB_FACET_POWER_SUPPLY) | LMB_FACET_BIT(LMB_FACET_CURRENT_STREAM) |
                           LMB_FACET_BIT(LMB_FACET_LOGIC_INPUT) | LMB_FACET_BIT(LMB_FACET_SIM_CONTROL)));
+    /* more simulators on request */
+    {
+#if defined(_WIN32)
+        _putenv("LMB_PPK2_SIMULATORS=3");
+#else
+        setenv("LMB_PPK2_SIMULATORS", "3", 1);
+#endif
+        lmb_device_info three[4];
+        size_t m = 0;
+        CHECK_RC(lmb_enumerate(ctx, LMB_ENUM_ONLY_SIMULATED, three, 4, &m), LMB_OK);
+        CHECK(m == 3 && strcmp(three[1].id, "sim:ppk2:2") == 0 && strcmp(three[2].id, "sim:ppk2:3") == 0);
+#if defined(_WIN32)
+        _putenv("LMB_PPK2_SIMULATORS=");
+#else
+        unsetenv("LMB_PPK2_SIMULATORS");
+#endif
+        CHECK_RC(lmb_enumerate(ctx, LMB_ENUM_ONLY_SIMULATED, NULL, 0, &m), LMB_OK);
+        CHECK(m == 1);
+    }
     /* hardware (none on a build machine, or real ones: either is fine) is listed apart from the simulator */
     size_t hw = 99;
     CHECK_RC(lmb_enumerate(ctx, LMB_ENUM_NO_SIMULATED, NULL, 0, &hw), LMB_OK);

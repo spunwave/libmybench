@@ -19,6 +19,9 @@
  *                     opens further independent simulators. It runs on the library's own PPK2
  *                     simulator through the real command builder and sample decoder, in process,
  *                     paced in real time at 100 kS/s; it needs no serial port, so it works on every platform.
+ *                     The environment variable LMB_PPK2_SIMULATORS=<n> (1 to 8) lists n of them
+ *                     ("sim:ppk2", "sim:ppk2:2", ...), for demos and for testing an application
+ *                     with several devices.
  *
  * Facet behaviour specific to this family:
  *   - Starting a stream selects the external-supply (ammeter) mode and 3.3 V when nothing was
