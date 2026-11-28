@@ -68,6 +68,7 @@ typedef enum lmb_facet_kind {
     LMB_FACET_ANALOG_INPUT = 4,   /**< voltage channels, hardware-timed or on demand */
     LMB_FACET_ANALOG_OUTPUT = 5,  /**< voltage outputs, hardware-timed or on demand */
     LMB_FACET_DIGITAL_IO = 6,     /**< static digital lines with a direction each */
+    LMB_FACET_SIM_CONTROL = 7,    /**< simulated devices only: load, lost samples, unplug and replug */
     LMB_FACET_KIND_END_
 } lmb_facet_kind;
 
@@ -142,7 +143,7 @@ LMB_API int lmb_device_get_info(const lmb_device *dev, lmb_device_info *out);
 
 /**
  * LMB_OK while the device is usable, LMB_ERR_DISCONNECTED once it went away (every facet call
- * then returns that too). The only way to learn about a lost device until hot-plug is implemented.
+ * then returns that too). lmb_poll_events reports a change of it as LMB_EVENT_STATUS.
  */
 LMB_API int lmb_device_status(lmb_device *dev);
 
@@ -156,7 +157,36 @@ LMB_API int lmb_device_status(lmb_device *dev);
 LMB_API int lmb_device_facet(lmb_device *dev, lmb_facet_kind kind, const void **out);
 
 /* ------------------------------------------------------------------------------------------ */
-/* Hot-plug (designed, not implemented)                                                       */
+/* Hot-plug                                                                                   */
+
+/**
+ * Polled events (lmb_poll_events): what changed since the previous call. Polling needs no thread
+ * of the library's own, which is what a single-threaded host (WebAssembly) and a Qt timer want.
+ */
+typedef enum lmb_event_type {
+    LMB_EVENT_ARRIVED = 1, /**< a device is listed that was not before */
+    LMB_EVENT_LEFT = 2,    /**< a listed device is gone */
+    LMB_EVENT_STATUS = 3   /**< an open device's lmb_device_status changed (it went away, or is back) */
+} lmb_event_type;
+
+typedef struct lmb_event {
+    uint32_t size;     /**< sizeof(lmb_event): set by the caller before lmb_poll_events, the library writes only what fits */
+    uint32_t type;     /**< lmb_event_type; an unknown value is something newer than the caller */
+    int32_t status;    /**< LMB_EVENT_STATUS: the lmb_status of the open device now (LMB_OK or LMB_ERR_DISCONNECTED) */
+    uint32_t reserved0;
+    lmb_device_info info; /**< the device (for LEFT, as last listed) */
+    uint32_t reserved[8];
+} lmb_event;
+
+/**
+ * Rescan (like lmb_enumerate, simulators included) and report the differences as events, oldest
+ * first: up to cap events into out, *count gets how many were written (cap 0 and out NULL: *count
+ * is how many are pending). Events that do not fit stay queued for the next call. The first call
+ * reports every device present as ARRIVED, so a caller needs no separate lmb_enumerate. Every
+ * open device whose status changed since the last call gets a STATUS event. Each element of out
+ * must have `size` set to sizeof(lmb_event). Safe from any thread (calls are serialised).
+ */
+LMB_API int lmb_poll_events(lmb_context *ctx, lmb_event *out, size_t cap, size_t *count);
 
 typedef enum lmb_hotplug_event {
     LMB_HOTPLUG_ARRIVED = 1,
@@ -172,8 +202,7 @@ typedef void (*lmb_hotplug_fn)(void *user, lmb_hotplug_event event, const lmb_de
 
 /**
  * Subscribe (cb non-NULL) or unsubscribe (cb NULL). Not implemented in this version: always
- * LMB_ERR_UNSUPPORTED. Until it is, call lmb_enumerate again and compare, and watch
- * lmb_device_status on open devices.
+ * LMB_ERR_UNSUPPORTED. Use lmb_poll_events.
  */
 LMB_API int lmb_set_hotplug(lmb_context *ctx, lmb_hotplug_fn cb, void *user);
 

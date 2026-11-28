@@ -23,6 +23,7 @@ struct lmb_device {
     lmb_device_ops ops;
     lmb_device_info info;
     int opening; /* placeholder while a family is opening it: no ops yet */
+    int last_status; /* what lmb_poll_events last saw of lmb_device_status */
     struct lmb_device *next;
 };
 
@@ -30,6 +31,14 @@ struct lmb_context {
     lmb_mutex *mu; /* guards devs */
     fam_node *fams, **fams_tail;
     lmb_device *devs;
+
+    /* lmb_poll_events: serialised by poll_mu; snap is the list as of the previous poll, queue holds
+     * the events not handed out yet. */
+    lmb_mutex *poll_mu;
+    lmb_device_info *snap;
+    size_t nsnap;
+    lmb_event *queue;
+    size_t nqueue, capqueue;
 };
 
 /* Common start of every facet vtable. */
@@ -75,6 +84,7 @@ const char *lmb_facet_name(int kind)
     case LMB_FACET_ANALOG_INPUT: return "analog-input";
     case LMB_FACET_ANALOG_OUTPUT: return "analog-output";
     case LMB_FACET_DIGITAL_IO: return "digital-io";
+    case LMB_FACET_SIM_CONTROL: return "sim-control";
     default: return "?";
     }
 }
@@ -90,7 +100,10 @@ int lmb_context_new(uint32_t abi_version, lmb_context **out)
     if (!c)
         return LMB_ERR_NO_MEM;
     c->mu = lmb_mutex_new();
-    if (!c->mu) {
+    c->poll_mu = lmb_mutex_new();
+    if (!c->mu || !c->poll_mu) {
+        lmb_mutex_free(c->mu);
+        lmb_mutex_free(c->poll_mu);
         free(c);
         return LMB_ERR_NO_MEM;
     }
@@ -119,6 +132,9 @@ void lmb_context_free(lmb_context *ctx)
         n = next;
     }
     lmb_mutex_free(ctx->mu);
+    lmb_mutex_free(ctx->poll_mu);
+    free(ctx->snap);
+    free(ctx->queue);
     free(ctx);
 }
 
@@ -234,6 +250,7 @@ int lmb_device_open(lmb_context *ctx, const char *id, lmb_device **out)
         if (!dup) {
             dev->ops = ops;
             dev->info = info;
+            dev->last_status = LMB_OK;
             strcpy(dev->key, info.id);
             dev->opening = 0;
         }
@@ -301,6 +318,104 @@ void *lmb_device_driver_data(lmb_device *dev, const char *family_name)
     if (!dev || !family_name || strcmp(dev->info.family, family_name) != 0)
         return NULL;
     return dev->ops.drv;
+}
+
+/* ---- polled events ---- */
+
+static int queue_event(lmb_context *ctx, lmb_event_type type, int status, const lmb_device_info *info)
+{
+    if (ctx->nqueue == ctx->capqueue) {
+        const size_t cap = ctx->capqueue ? ctx->capqueue * 2 : 16;
+        lmb_event *q = realloc(ctx->queue, cap * sizeof *q);
+        if (!q)
+            return LMB_ERR_NO_MEM;
+        ctx->queue = q;
+        ctx->capqueue = cap;
+    }
+    lmb_event *e = &ctx->queue[ctx->nqueue++];
+    memset(e, 0, sizeof *e);
+    e->size = sizeof *e;
+    e->type = (uint32_t)type;
+    e->status = status;
+    e->info = *info;
+    return LMB_OK;
+}
+
+static const lmb_device_info *find_info(const lmb_device_info *list, size_t n, const char *id)
+{
+    for (size_t i = 0; i < n; i++)
+        if (strcmp(list[i].id, id) == 0)
+            return &list[i];
+    return NULL;
+}
+
+int lmb_poll_events(lmb_context *ctx, lmb_event *out, size_t cap, size_t *count)
+{
+    if (!ctx || !count || (cap && !out))
+        return LMB_ERR_INVALID_ARG;
+    *count = 0;
+    for (size_t i = 0; i < cap; i++)
+        if (out[i].size < 4 * sizeof(uint32_t))
+            return LMB_ERR_INVALID_ARG; /* `size` not set: the caller must set it to sizeof(lmb_event) */
+    lmb_mutex_lock(ctx->poll_mu);
+
+    /* The list now. A family that cannot list is skipped, as in lmb_enumerate. */
+    size_t total = 0;
+    int rc = lmb_enumerate(ctx, 0, NULL, 0, &total);
+    lmb_device_info *now = NULL;
+    size_t nnow = 0;
+    if (rc == LMB_OK && total) {
+        now = calloc(total, sizeof *now);
+        if (!now)
+            rc = LMB_ERR_NO_MEM;
+        else
+            rc = lmb_enumerate(ctx, 0, now, total, &nnow);
+        if (rc == LMB_OK && nnow > total)
+            nnow = total; /* a device appeared between the two calls: the next poll reports it */
+    }
+    if (rc == LMB_OK) {
+        for (size_t i = 0; i < nnow; i++)
+            if (!find_info(ctx->snap, ctx->nsnap, now[i].id))
+                (void)queue_event(ctx, LMB_EVENT_ARRIVED, LMB_OK, &now[i]);
+        for (size_t i = 0; i < ctx->nsnap; i++)
+            if (!find_info(now, nnow, ctx->snap[i].id))
+                (void)queue_event(ctx, LMB_EVENT_LEFT, LMB_OK, &ctx->snap[i]);
+        free(ctx->snap);
+        ctx->snap = now;
+        ctx->nsnap = nnow;
+    } else {
+        free(now);
+    }
+
+    /* Open devices whose status changed. */
+    lmb_mutex_lock(ctx->mu);
+    for (lmb_device *d = ctx->devs; d; d = d->next) {
+        if (d->opening)
+            continue;
+        const int st = lmb_device_status(d);
+        if (st != d->last_status) {
+            d->last_status = st;
+            (void)queue_event(ctx, LMB_EVENT_STATUS, st, &d->info);
+        }
+    }
+    lmb_mutex_unlock(ctx->mu);
+
+    size_t n = ctx->nqueue < cap ? ctx->nqueue : cap;
+    if (out) {
+        for (size_t i = 0; i < n; i++) {
+            /* Only what fits in the caller's struct (it may be older and shorter). */
+            const uint32_t want = out[i].size;
+            memcpy(&out[i], &ctx->queue[i], want < sizeof(lmb_event) ? want : sizeof(lmb_event));
+            out[i].size = want;
+        }
+        memmove(ctx->queue, ctx->queue + n, (ctx->nqueue - n) * sizeof *ctx->queue);
+        ctx->nqueue -= n;
+        *count = n;
+    } else {
+        *count = ctx->nqueue; /* cap 0: how many are pending */
+    }
+    lmb_mutex_unlock(ctx->poll_mu);
+    return rc;
 }
 
 int lmb_set_hotplug(lmb_context *ctx, lmb_hotplug_fn cb, void *user)

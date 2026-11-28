@@ -20,7 +20,8 @@
  *     give sample indexes on the device's timeline, and time is index / sample_rate_hz.
  *   - Info structs are filled by the facet: set `size` to sizeof before the call.
  *
- * Implemented so far: PowerSupply, CurrentStream, LogicInput (the PPK2 driver). AnalogInput,
+ * Implemented so far: PowerSupply, CurrentStream, LogicInput (the PPK2 driver) and SimControl
+ * (simulated devices). AnalogInput,
  * AnalogOutput and DigitalIO are the shape the NI myDAQ needs; no driver in this repository has
  * them yet, and they may still change before 1.0 when the myDAQ adapter exercises them.
  */
@@ -87,6 +88,15 @@ typedef struct lmb_power_supply {
 /* ------------------------------------------------------------------------------------------ */
 /* Streams: CurrentStream and LogicInput                                                       */
 /*
+ * Current flows only while the DUT is connected: on a PPK2 the current stream reads (close to)
+ * zero until the PowerSupply output ("DUT power") is switched on, in ammeter mode as well as in
+ * source mode. Start the stream first if you like, but switch the output on to measure anything.
+ *
+ * Lost samples: `lost` on a flagged sample is only a lower bound (the PPK2's sequence number is 6
+ * bits, so a loss of a multiple of 64 samples goes unseen). The timeline index of every sample
+ * is exact, so the true number lost between two reads is the jump in first_index (and in the
+ * indexes inside a read, which account for the lost samples that were seen).
+ *
  * A device that samples several things at once (the PPK2 samples current and eight logic lines
  * in the same 32-bit word) has one acquisition and one timeline. Each stream facet has its own
  * start, stop and read position: starting a second facet joins the running acquisition, and
@@ -101,7 +111,8 @@ typedef struct lmb_power_supply {
 typedef struct lmb_current_sample {
     double current_a;
     uint32_t flags;   /**< LMB_SAMPLE_* */
-    uint32_t lost;    /**< with LMB_SAMPLE_GAP: samples lost before this one (a lower bound), saturating */
+    uint32_t lost;    /**< with LMB_SAMPLE_GAP: samples lost before this one. A LOWER BOUND, saturating: use the
+                           index jumps of read() (first_index) for the true count. */
 } lmb_current_sample;
 
 /** One snapshot of the logic lines. Frozen layout. */
@@ -262,6 +273,26 @@ typedef struct lmb_digital_io {
 } lmb_digital_io;
 
 /* ------------------------------------------------------------------------------------------ */
+/* SimControl: drives a simulated device, so an application and its tests need no family header */
+
+typedef struct lmb_sim_control {
+    uint32_t abi_version;
+    uint32_t size;
+    void *self;
+    /** Constant current drawn by the simulated DUT, amperes (>= 0). Takes effect at once. */
+    int (*set_load)(void *self, double amps);
+    /** Lose n samples on the simulated wire: the stream reports a gap. */
+    int (*drop)(void *self, uint64_t n);
+    /** Pretend the unit was unplugged: every later call (and lmb_device_status) returns LMB_ERR_DISCONNECTED. */
+    int (*disconnect)(void *self);
+    /** Plug it back in: the same open device works again (a stream that was running must be restarted). */
+    int (*reconnect)(void *self);
+    /** A repeating load: peak_a for duty (0..1) of every period_s seconds of the stream's timeline,
+     *  base_a for the rest. Replaces set_load until set_load is called again. */
+    int (*set_load_pulses)(void *self, double base_a, double peak_a, double period_s, double duty);
+} lmb_sim_control;
+
+/* ------------------------------------------------------------------------------------------ */
 /* Typed lookups                                                                              */
 
 #define LMB_FACET_GETTER_(fn, kind, type)                                                       \
@@ -280,6 +311,7 @@ LMB_FACET_GETTER_(lmb_device_logic_input, LMB_FACET_LOGIC_INPUT, lmb_logic_input
 LMB_FACET_GETTER_(lmb_device_analog_input, LMB_FACET_ANALOG_INPUT, lmb_analog_input)
 LMB_FACET_GETTER_(lmb_device_analog_output, LMB_FACET_ANALOG_OUTPUT, lmb_analog_output)
 LMB_FACET_GETTER_(lmb_device_digital_io, LMB_FACET_DIGITAL_IO, lmb_digital_io)
+LMB_FACET_GETTER_(lmb_device_sim_control, LMB_FACET_SIM_CONTROL, lmb_sim_control)
 
 #ifdef __cplusplus
 }

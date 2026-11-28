@@ -8,6 +8,10 @@
  * facets, power order, streaming (mean current, no gaps, aligned logic), gaps, a slow reader,
  * a lost device, and two threads on one device. Runs in real time (100 kS/s). */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L /* setenv, unsetenv under -std=c11 */
+#endif
+
 #include "libmybench/device.h"
 #include "libmybench/facets.h"
 #include "libmybench/ppk2_family.h"
@@ -103,7 +107,26 @@ static void test_registry(void)
     CHECK(strcmp(info.id, "sim:ppk2") == 0 && strcmp(info.family, "ppk2") == 0 && info.simulated == 1);
     CHECK(strcmp(info.transport, "sim") == 0);
     CHECK(info.facets == (LMB_FACET_BIT(LMB_FACET_POWER_SUPPLY) | LMB_FACET_BIT(LMB_FACET_CURRENT_STREAM) |
-                          LMB_FACET_BIT(LMB_FACET_LOGIC_INPUT)));
+                          LMB_FACET_BIT(LMB_FACET_LOGIC_INPUT) | LMB_FACET_BIT(LMB_FACET_SIM_CONTROL)));
+    /* more simulators on request */
+    {
+#if defined(_WIN32)
+        _putenv("LMB_PPK2_SIMULATORS=3");
+#else
+        setenv("LMB_PPK2_SIMULATORS", "3", 1);
+#endif
+        lmb_device_info three[4];
+        size_t m = 0;
+        CHECK_RC(lmb_enumerate(ctx, LMB_ENUM_ONLY_SIMULATED, three, 4, &m), LMB_OK);
+        CHECK(m == 3 && strcmp(three[1].id, "sim:ppk2:2") == 0 && strcmp(three[2].id, "sim:ppk2:3") == 0);
+#if defined(_WIN32)
+        _putenv("LMB_PPK2_SIMULATORS=");
+#else
+        unsetenv("LMB_PPK2_SIMULATORS");
+#endif
+        CHECK_RC(lmb_enumerate(ctx, LMB_ENUM_ONLY_SIMULATED, NULL, 0, &m), LMB_OK);
+        CHECK(m == 1);
+    }
     /* hardware (none on a build machine, or real ones: either is fine) is listed apart from the simulator */
     size_t hw = 99;
     CHECK_RC(lmb_enumerate(ctx, LMB_ENUM_NO_SIMULATED, NULL, 0, &hw), LMB_OK);
@@ -147,6 +170,71 @@ static void test_registry(void)
     lmb_device_close(other);
     lmb_device_close(dev);
     lmb_context_free(ctx);
+}
+
+/* The generic simulator-control facet: no family header needed, only what facets.h declares. */
+static void test_sim_control(void)
+{
+    bench b;
+    CHECK(bench_open(&b, "sim:ppk2") == 0);
+    const lmb_sim_control *sc = NULL;
+    CHECK_RC(lmb_device_sim_control(b.dev, &sc), LMB_OK);
+    CHECK(sc && sc->abi_version == LMB_ABI_VERSION && LMB_HAS(sc, set_load) && LMB_HAS(sc, drop) &&
+          LMB_HAS(sc, disconnect) && LMB_HAS(sc, reconnect) && LMB_HAS(sc, set_load_pulses));
+    CHECK_RC(sc->set_load(sc->self, -1.0), LMB_ERR_INVALID_ARG);
+    CHECK_RC(sc->set_load(sc->self, NAN), LMB_ERR_INVALID_ARG);
+    CHECK_RC(sc->set_load_pulses(sc->self, 1e-3, 5e-3, 0.0, 0.5), LMB_ERR_INVALID_ARG);   /* no period */
+    CHECK_RC(sc->set_load_pulses(sc->self, 1e-3, 5e-3, 0.01, 1.5), LMB_ERR_INVALID_ARG);   /* duty > 1 */
+
+    CHECK_RC(b.ps->set_mode(b.ps->self, LMB_SUPPLY_EXTERNAL), LMB_OK);
+    CHECK_RC(b.ps->set_voltage(b.ps->self, 3.3, NULL), LMB_OK);
+    CHECK_RC(b.ps->set_output(b.ps->self, 1), LMB_OK);   /* current flows only with the DUT gate on */
+    CHECK_RC(sc->set_load(sc->self, 3e-3), LMB_OK);
+    CHECK_RC(b.cs->start(b.cs->self), LMB_OK);
+    lmb_current_sample *s = malloc(8000 * sizeof *s);
+    CHECK(collect(b.cs, s, 4000, NULL) == 4000);
+    double mean = 0;
+    for (size_t i = 2000; i < 4000; i++)
+        mean += s[i].current_a / 2000.0;
+    CHECK(fabs(mean - 3e-3) < 0.1e-3);
+
+    /* a pulsed load: 0.5 mA with 5 mA pulses for half of every 10 ms */
+    CHECK_RC(sc->set_load_pulses(sc->self, 0.5e-3, 5e-3, 0.01, 0.5), LMB_OK);
+    CHECK(collect(b.cs, s, 2000, NULL) == 2000); /* what was queued before the change */
+    CHECK(collect(b.cs, s, 4000, NULL) == 4000);
+    double lo = 1.0, hi = 0.0;
+    for (size_t i = 0; i < 4000; i++) {
+        if (s[i].current_a < lo)
+            lo = s[i].current_a;
+        if (s[i].current_a > hi)
+            hi = s[i].current_a;
+    }
+    CHECK(lo < 1e-3 && hi > 4e-3);
+
+    /* lost samples, then unplug and replug the same open device */
+    CHECK_RC(sc->drop(sc->self, 7), LMB_OK);
+    size_t gaps = 0;
+    for (int round = 0; round < 10 && !gaps; round++) {
+        size_t got = collect(b.cs, s, 1000, NULL);
+        for (size_t i = 0; i < got; i++)
+            if ((s[i].flags & LMB_SAMPLE_GAP) && s[i].lost == 7)
+                gaps++;
+    }
+    CHECK(gaps == 1);
+    CHECK_RC(sc->disconnect(sc->self), LMB_OK);
+    CHECK_RC(lmb_device_status(b.dev), LMB_ERR_DISCONNECTED);
+    size_t got = 0;
+    CHECK_RC(b.cs->read(b.cs->self, s, 8, 10, &got, NULL), LMB_ERR_DISCONNECTED);
+    CHECK_RC(sc->reconnect(sc->self), LMB_OK);
+    CHECK_RC(lmb_device_status(b.dev), LMB_OK);
+    CHECK_RC(b.cs->stop(b.cs->self), LMB_OK);
+    CHECK_RC(b.cs->start(b.cs->self), LMB_OK);
+    CHECK(collect(b.cs, s, 1000, NULL) == 1000);
+    free(s);
+
+    /* the facet is listed for simulators only, and the legacy family calls still work */
+    CHECK_RC(lmb_ppk2_sim_set_load(b.dev, 1e-3), LMB_OK);
+    bench_close(&b);
 }
 
 static void test_power_order(void)
@@ -428,6 +516,7 @@ int main(void)
     test_registry();
     test_power_order();
     test_stream();
+    test_sim_control();
     test_gap();
     test_slow_reader();
     test_gone_and_reopen();
