@@ -25,6 +25,13 @@ endif()
 set(CMAKE_C_VISIBILITY_PRESET hidden)
 
 include(GNUInstallDirs)
+
+# Windows finds DLLs next to the executable, not through an rpath: with BUILD_SHARED_LIBS the
+# tests and tools would miss the libraries built in other folders, and the "DLL not found" dialog
+# blocks a headless run forever. Put every executable and DLL of this build in one bin/ folder.
+if(WIN32 AND CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
+endif()
 include(cmake/LibmybenchModule.cmake)
 
 if(LIBMYBENCH_FUZZ)
