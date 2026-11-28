@@ -209,8 +209,11 @@ int lmb_device_open(lmb_context *ctx, const char *id, lmb_device **out)
     lmb_mutex_unlock(ctx->mu);
 
     int rc = LMB_ERR_NOT_FOUND;
+    /* Zeroed up front too: MSVC (C4701) can't see that they are only read after a family's open. */
     lmb_device_ops ops;
     lmb_device_info info;
+    memset(&ops, 0, sizeof ops);
+    memset(&info, 0, sizeof info);
     for (const fam_node *n = ctx->fams; n; n = n->next) {
         memset(&ops, 0, sizeof ops);
         memset(&info, 0, sizeof info);
