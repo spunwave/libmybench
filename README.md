@@ -14,13 +14,62 @@ MCP server, a web build, Python) and the device drivers. Each device family is o
 
 | Module | Device | Status |
 |---|---|---|
-| `drivers/ppk2` (`libmybench::ppk2`) | Nordic Power Profiler Kit II | protocol core, simulator, device layer on the serial transport, `.ppk2` files (read and write), `ppk2-tool`; tested end to end against the simulator on a pseudo-terminal, not yet on hardware |
+| `core` (`libmybench::core`) | the device model | registry, enumeration, open/close, capability facets, error codes, ABI version: plain C ABI, see [docs/DEVICE-MODEL.md](docs/DEVICE-MODEL.md) |
+| `builtin` (`libmybench::builtin`) | | `lmb_register_builtin_families`: the families this build contains, so applications need no family-specific code |
+| `drivers/ppk2` (`libmybench::ppk2`) | Nordic Power Profiler Kit II | protocol core, simulator, device layer on the serial transport, `.ppk2` files (read and write), `ppk2-tool`; family of the device model (PowerSupply, CurrentStream, LogicInput, plus a simulated PPK2 `sim:ppk2`); tested end to end against the simulator, not yet on hardware |
 | `transports/serial` (`libmybench::serial`) | USB CDC and other serial ports | list ports with their USB ids and interface (Linux sysfs, macOS IOKit, Windows SetupAPI), open raw with DTR, timed reads, exclusive use (busy detection) |
 
-Planned: the device model and capability facets (`AnalogInput`, `PowerSupply`, `CurrentStream`,
-`LogicInput`, …), discovery and hot-plug, Web Serial, the RP2
-component tester, the DSP moved out of the app, and file formats. The design and order of work are in
+Planned: hot-plug (declared, not implemented), the `AnalogInput`, `AnalogOutput` and `DigitalIO` facets
+(headers exist, shaped for the myDAQ, no driver yet), Counter and Dmm facets, Web Serial, the RP2
+component tester, the DSP moved out of the app, and more file formats. The design and order of work are in
 MYBENCH's `docs/design/driver-architecture-options.md`.
+
+## The device model API
+
+Applications use three headers and no family-specific code (C11, `libmybench/device.h` and `facets.h`):
+
+```c
+lmb_context *ctx;
+lmb_context_new(LMB_ABI_VERSION, &ctx);
+lmb_register_builtin_families(ctx);
+
+lmb_device_info list[16]; size_t n;
+lmb_enumerate(ctx, 0, list, 16, &n);          // id, family, name, serial, transport, facets mask
+
+lmb_device *dev;
+lmb_device_open(ctx, "sim:ppk2", &dev);       // a simulated PPK2 is always listed
+const lmb_current_stream *cs;
+lmb_device_current_stream(dev, &cs);          // LMB_ERR_NO_FACET if the device can't
+cs->start(cs->self);
+lmb_current_sample buf[1024]; size_t got; uint64_t first;
+cs->read(cs->self, buf, 1024, 100 /* ms */, &got, &first);
+cs->stop(cs->self);
+lmb_device_close(dev);
+lmb_context_free(ctx);
+```
+
+| | |
+|---|---|
+| `lmb_context_new`, `lmb_context_free`, `lmb_register_builtin_families` | the registry; families register explicitly |
+| `lmb_enumerate`, `lmb_device_open`, `lmb_device_close`, `lmb_device_status` | find, open, release, ask whether it is still there |
+| `lmb_device_facet` and typed `lmb_device_power_supply` etc. | capability lookup: vtables `lmb_power_supply`, `lmb_current_stream`, `lmb_logic_input`, and the myDAQ-shaped `lmb_analog_input`, `lmb_analog_output`, `lmb_digital_io` |
+| `lmb_status` / `lmb_strerror` | explicit error codes; no exceptions, no aborts |
+
+Streams are pull reads with a timeout, samples carry their index on the device's timeline, and lost
+samples are flagged, never skipped silently. [docs/DEVICE-MODEL.md](docs/DEVICE-MODEL.md) has the ABI and
+versioning rules, the threading rules, how a driver family plugs in, and how the MYBENCH app consumes it.
+
+## lmb-tool
+
+A generic client built only on that API (no PPK2 code in it):
+
+```sh
+lmb-tool list                                   # id, family, name, transport, serial, facets
+lmb-tool info --device sim:ppk2
+lmb-tool stream --device sim:ppk2 --seconds 1 --power             # mean/min/max current, gaps, logic activity
+lmb-tool stream --device sim:ppk2 --seconds 1 --csv > run.csv     # index,time_s,current_a
+lmb-tool stream --device ppk2:<serial> --supply internal --volts 3.3 --power --seconds 5
+```
 
 ## How drivers are written
 
@@ -43,11 +92,11 @@ ctest --test-dir build --output-on-failure
 |---|---|---|
 | `LIBMYBENCH_DRIVER_PPK2` | ON | the PPK2 module |
 | `LIBMYBENCH_TRANSPORT_SERIAL` | ON | the serial transport; without it the PPK2 module has no device layer (core, simulator and files only) |
-| `LIBMYBENCH_BUILD_TESTS` / `_TOOLS` | ON | unit tests, `ppk2-tool` |
+| `LIBMYBENCH_BUILD_TESTS` / `_TOOLS` | ON | unit tests, `ppk2-tool`, `lmb-tool` |
 | `LIBMYBENCH_FUZZ` | OFF | libFuzzer targets (clang): `ppk2_fuzz_meta`, `ppk2_fuzz_stream`, `ppk2_fuzz_file`; the library itself is instrumented too |
-| `BUILD_SHARED_LIBS` | OFF | shared libraries export only the public API (`ppk2_*`, `lmb_serial_*`) |
+| `BUILD_SHARED_LIBS` | OFF | shared libraries export only the public API (`lmb_*`, `ppk2_*`, `lmb_serial_*`) |
 
-Use from CMake: `find_package(libmybench)` and link `libmybench::ppk2` (it brings `libmybench::serial`).
+Use from CMake: `find_package(libmybench)` and link `libmybench::builtin` (the device model with every family built in), or one module, e.g. `libmybench::ppk2` (it brings `libmybench::core` and `libmybench::serial`). On Linux and macOS the core uses pthreads.
 
 `.ppk2` files are ZIP archives; the reader and writer use miniz 3.1.2 (MIT), vendored in `third_party/miniz/`
 and built into the library with hidden symbols.

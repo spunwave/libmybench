@@ -8,11 +8,18 @@ function(libmybench_module name)
     set(tgt libmybench_${name})
     add_library(${tgt} ${ARG_SOURCES})
     add_library(libmybench::${name} ALIAS ${tgt})
-    target_include_directories(${tgt}
-        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    # A module without headers of its own (the core: its headers are the shared include/) has no include/.
+    if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_include_directories(${tgt}
+            PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+    endif()
+    target_include_directories(${tgt} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     target_link_libraries(${tgt} PUBLIC libmybench_base ${ARG_LIBS})
+    if(NOT WIN32)
+        find_package(Threads REQUIRED)
+        target_link_libraries(${tgt} PRIVATE Threads::Threads)
+    endif()
     target_compile_definitions(${tgt} PRIVATE LIBMYBENCH_BUILDING)
     if(NOT BUILD_SHARED_LIBS)
         target_compile_definitions(${tgt} PUBLIC LIBMYBENCH_STATIC)
@@ -27,7 +34,9 @@ function(libmybench_module name)
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-    install(DIRECTORY include/libmybench DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    if(IS_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        install(DIRECTORY include/libmybench DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+    endif()
 endfunction()
 
 function(libmybench_warnings tgt)
