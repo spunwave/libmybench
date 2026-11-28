@@ -67,6 +67,7 @@ before opening anything.
 | AnalogInput (channels, ranges, rate, finite or continuous, on-demand read) | - | AI0/AI1 at 200 kS/s, audio in | shape only |
 | AnalogOutput (same, regenerate or stream) | - | AO0/AO1, audio out | shape only |
 | DigitalIO (direction per line, write, read) | - | DIO 0 to 7 | shape only |
+| SimControl (load, pulsed load, lost samples, unplug, replug) | simulator only | simulator, later | implemented (PPK2 simulator) |
 
 Not yet shaped, and added when the myDAQ adapter needs them: Counter (edge count, frequency, period,
 pulse width, encoders), Dmm (functions and ranges, one blocking reading), FrequencyOutput. They are new
@@ -91,8 +92,28 @@ two readers in different threads, can be aligned. Time is `index / sample_rate_h
 out wall-clock timestamps, because a USB device has none.
 
 Lost samples are part of the timeline: when the device reports that `n` samples were lost, the next sample
-has `LMB_SAMPLE_GAP` and `lost = n` (a lower bound: the PPK2's sequence number is 6 bits, so multiples of
-64 go unseen), and its index skips them.
+has `LMB_SAMPLE_GAP` and `lost = n`, and its index skips them. **`lost` is a lower bound**: the PPK2's
+sequence number is 6 bits, so a loss of a multiple of 64 samples (a whole 512-sample block, say) goes
+unseen, and the count saturates. The timeline index of every sample is exact for the samples that were
+seen, so the number really lost between two reads is the jump in `first_index`, and the position of the
+gap inside a read is the index of the flagged sample. Use index jumps when the exact count matters; use
+`lost` and `LMB_SAMPLE_GAP` to know where the data is not continuous.
+
+**Current flows only with the DUT gate on.** On a PPK2 the DUT gate sits after the shunts: with the
+PowerSupply output ("DUT power") off, the current stream reads zero in ammeter mode as well as in source
+mode. Starting a stream does not switch the output on, so a client that wants to measure sets the mode and
+voltage, switches the output on and then starts (or starts first and switches on: the stream just reads
+zero until then). The simulator behaves the same way.
+
+### Simulated devices: the SimControl facet
+
+A simulated device also has the SimControl facet (`lmb_sim_control`, `lmb_device_sim_control`), so an
+application, a test or a demo can drive it without including a family header: `set_load` (constant current of
+the simulated DUT), `set_load_pulses` (base and peak current, period, duty), `drop` (lose n samples on the
+simulated wire), `disconnect` (every later call returns `LMB_ERR_DISCONNECTED`) and `reconnect` (the same
+open device works again; restart a stream that was running). Hardware never has the facet, so
+`lmb_device_info.facets` tells beforehand whether the controls exist. The family functions
+(`lmb_ppk2_sim_set_load` and so on) remain and do the same.
 
 ## ABI and versioning
 
@@ -141,7 +162,7 @@ A read that times out is **not** an error: it returns `LMB_OK` with `*got = 0`. 
 - **Close**: `lmb_device_close` must not run while another thread is inside a call on that device. Stop your
   reader thread first (stop the stream, then join), then close. Closing stops streams and puts the device in
   its safe state; for the PPK2 that means the DUT is disconnected.
-- **No callbacks into your code**, except hot-plug (below). Streams are **pull**: you call `read` with a
+- **No callbacks into your code.** Streams are **pull**: you call `read` with a
   timeout and the library never calls you from a thread of its own. Reasons: it matches how the serial and
   USB layers work (`ppk2_dev_read`), it keeps ownership and thread questions out of the ABI, it works the
   same from a Qt worker, a Python thread and a single-threaded WebAssembly main loop, and a push API can be
@@ -151,14 +172,28 @@ A read that times out is **not** an error: it returns `LMB_OK` with `*got = 0`. 
   silently).
 - A read never waits longer than its timeout. A negative timeout is an error; there is no "forever".
 
-## Hot-plug (designed, not implemented)
+## Hot-plug: polled events
 
-`lmb_set_hotplug(ctx, cb, user)` and `lmb_hotplug_fn` are declared and return `LMB_ERR_UNSUPPORTED`. The
-intended behaviour: the callback runs on a library thread, one event at a time, with the descriptor of the
-device that arrived or left; it must only post to the application's queue (no `lmb_device_close`, no long
-work). An open device that disappears returns `LMB_ERR_DISCONNECTED` from every call, and
-`lmb_device_status` reports it too, which already works (the simulator can pretend:
-`lmb_ppk2_sim_disconnect`). Until the callback exists, rescan with `lmb_enumerate`.
+`lmb_poll_events(ctx, out, cap, &n)` rescans (like `lmb_enumerate`) and reports what changed since the previous
+call, oldest first, as `lmb_event`s:
+
+| Event | Meaning |
+|---|---|
+| `LMB_EVENT_ARRIVED` | a device is listed that was not before (the first call reports every device present) |
+| `LMB_EVENT_LEFT` | a listed device is gone (`info` is what was listed) |
+| `LMB_EVENT_STATUS` | an open device's `lmb_device_status` changed: `status` is `LMB_ERR_DISCONNECTED` or `LMB_OK` again |
+
+Events that do not fit in `cap` stay queued for the next call; `cap` 0 with `out` NULL returns how many are
+pending. Each `lmb_event` carries its `size` (set it to `sizeof(lmb_event)` before the call; a caller built
+with a shorter struct receives only the prefix that fits). Calls are serialised, so any thread may poll, but
+one poller per context is the sensible shape.
+
+Polling needs no thread of the library's own, so it works from a Qt timer, a Python loop and the single
+main loop of a WebAssembly build alike; how often to call it is the application's choice (a rescan of
+serial ports is cheap, a USB probe may not be). The callback `lmb_set_hotplug` stays declared and returns
+`LMB_ERR_UNSUPPORTED`: a library thread calling into the application is exactly what this API avoids.
+An open device that disappears returns `LMB_ERR_DISCONNECTED` from every call; the STATUS event is how a
+poller learns of it without touching the device.
 
 ## Writing a device family
 
@@ -212,7 +247,7 @@ No change to the app is part of this repository; this is the intended shape of t
 One generic C++ adapter in the app, `bench::Device` implemented once over `lmb_device`, replaces one adapter
 per family:
 
-- **Discovery**: a provider that calls `lmb_enumerate` (on a timer until hot-plug exists) and turns each
+- **Discovery**: a provider that calls `lmb_poll_events` (on a timer) and turns each
   `lmb_device_info` into the app's `DeviceInfo`; `facets` drives which instruments are enabled
   (`InstrumentDescriptor.requires`).
 - **Facets**: the adapter exposes each `lmb_*` facet as the matching `bench::` facet object. The mapping is
@@ -234,8 +269,9 @@ separate decision and is not assumed here.
 ## Open questions
 
 - The AI/AO/DIO shapes are drawn from the app's current interface, not exercised by a driver.
-- Hot-plug: a callback thread owned by the library (as designed), or a polling `lmb_poll_events`?
-  The second is friendlier to WebAssembly and to single-threaded hosts and could be offered in addition.
+- Hot-plug is polled (`lmb_poll_events`); a callback thread owned by the library is not planned. A family
+  that can be told by the operating system (udev, WM_DEVICECHANGE) could make polling cheaper later without
+  changing the API.
 - Sample structs are per facet and small (16 bytes). If a future device needs millions of samples per
   second, a second read function that takes a struct-of-arrays buffer can be added without breaking anything.
 - Changing the supply voltage during a stream (profiling a voltage sweep) is not supported yet: it needs

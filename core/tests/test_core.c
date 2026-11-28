@@ -35,6 +35,8 @@ typedef struct fake {
 } fake;
 
 static int g_closed, g_destroyed;
+static int g_unlisted[4];    /* test hook: fake:<n> is not listed while set */
+static int g_unplugged[4];   /* test hook: an open fake:<n> reports LMB_ERR_DISCONNECTED while set */
 
 static int fake_info(void *self, lmb_digital_io_info *out)
 {
@@ -73,7 +75,8 @@ static int fake_facet(void *drv, lmb_facet_kind kind, const void **out)
 
 static int fake_status(void *drv)
 {
-    return ((fake *)drv)->number == 2 ? LMB_ERR_DISCONNECTED : LMB_OK;
+    const int n = ((fake *)drv)->number;
+    return n == 2 || g_unplugged[n] ? LMB_ERR_DISCONNECTED : LMB_OK;
 }
 
 static void fill_info(lmb_device_info *i, int n)
@@ -95,6 +98,8 @@ static int fake_enumerate(void *user, uint32_t flags, lmb_device_info *out, size
         if ((flags & LMB_ENUM_NO_SIMULATED) && n != 3)
             continue;
         if ((flags & LMB_ENUM_ONLY_SIMULATED) && n == 3)
+            continue;
+        if (g_unlisted[n])
             continue;
         if (*count < cap)
             fill_info(&out[*count], n);
@@ -251,12 +256,73 @@ static void test_enumerate_open(void)
     CHECK(g_closed == closed_before + 2);
 }
 
+static void test_events(void)
+{
+    lmb_context *ctx;
+    CHECK(lmb_context_new(LMB_ABI_VERSION, &ctx) == LMB_OK);
+    lmb_family f = fake_family();
+    CHECK(lmb_context_register_family(ctx, &f) == LMB_OK);
+
+    lmb_event ev[8];
+    for (int i = 0; i < 8; i++)
+        ev[i].size = sizeof ev[i];
+    size_t n = 99;
+    CHECK(lmb_poll_events(NULL, ev, 8, &n) == LMB_ERR_INVALID_ARG);
+    CHECK(lmb_poll_events(ctx, NULL, 8, &n) == LMB_ERR_INVALID_ARG);
+    CHECK(lmb_poll_events(ctx, ev, 8, NULL) == LMB_ERR_INVALID_ARG);
+    lmb_event unsized[1];
+    memset(unsized, 0, sizeof unsized);
+    CHECK(lmb_poll_events(ctx, unsized, 1, &n) == LMB_ERR_INVALID_ARG); /* size not set */
+
+    /* The first poll is the baseline: everything present arrives. A small cap keeps the rest queued. */
+    CHECK(lmb_poll_events(ctx, ev, 2, &n) == LMB_OK && n == 2);
+    CHECK(ev[0].type == LMB_EVENT_ARRIVED && strcmp(ev[0].info.id, "fake:1") == 0);
+    CHECK(ev[1].type == LMB_EVENT_ARRIVED && strcmp(ev[1].info.id, "fake:2") == 0);
+    CHECK(lmb_poll_events(ctx, NULL, 0, &n) == LMB_OK && n == 1); /* cap 0: pending */
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 1 && strcmp(ev[0].info.id, "fake:3") == 0);
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 0); /* nothing changed */
+
+    /* A device leaves, then comes back. */
+    g_unlisted[1] = 1;
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 1);
+    CHECK(ev[0].type == LMB_EVENT_LEFT && strcmp(ev[0].info.id, "fake:1") == 0 && strcmp(ev[0].info.name, "Fake 1") == 0);
+    g_unlisted[1] = 0;
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 1 && ev[0].type == LMB_EVENT_ARRIVED);
+
+    /* An open device that goes away, and returns. fake:2 reports DISCONNECTED from the start. */
+    lmb_device *d1 = NULL, *d2 = NULL;
+    CHECK(lmb_device_open(ctx, "fake:1", &d1) == LMB_OK && lmb_device_open(ctx, "fake:2", &d2) == LMB_OK);
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 1);   /* fake:2: OK -> disconnected */
+    CHECK(ev[0].type == LMB_EVENT_STATUS && ev[0].status == LMB_ERR_DISCONNECTED && strcmp(ev[0].info.id, "fake:2") == 0);
+    g_unplugged[1] = 1;
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 1);
+    CHECK(ev[0].type == LMB_EVENT_STATUS && ev[0].status == LMB_ERR_DISCONNECTED && strcmp(ev[0].info.id, "fake:1") == 0);
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 0);   /* reported once */
+    g_unplugged[1] = 0;
+    CHECK(lmb_poll_events(ctx, ev, 8, &n) == LMB_OK && n == 1 && ev[0].type == LMB_EVENT_STATUS && ev[0].status == LMB_OK);
+
+    /* A caller built with a shorter struct gets only what fits and keeps its size. */
+    g_unlisted[2] = 1;
+    lmb_event shorter[1];
+    memset(shorter, 0xAA, sizeof shorter);
+    shorter[0].size = 16;
+    CHECK(lmb_poll_events(ctx, shorter, 1, &n) == LMB_OK && n == 1);
+    CHECK(shorter[0].size == 16 && shorter[0].type == LMB_EVENT_LEFT);
+    CHECK(((const unsigned char *)&shorter[0])[16] == 0xAA);   /* nothing written past it */
+    g_unlisted[2] = 0;
+
+    lmb_device_close(d1);
+    lmb_device_close(d2);
+    lmb_context_free(ctx);
+}
+
 static void test_strings(void)
 {
     for (int c = LMB_OK; c >= LMB_ERR_OVERFLOW; c--)
         CHECK(strcmp(lmb_strerror(c), "unknown error") != 0);
     CHECK(strcmp(lmb_strerror(-999), "unknown error") == 0);
     CHECK(strcmp(lmb_facet_name(LMB_FACET_CURRENT_STREAM), "current-stream") == 0);
+    CHECK(strcmp(lmb_facet_name(LMB_FACET_SIM_CONTROL), "sim-control") == 0);
     CHECK(strcmp(lmb_facet_name(0), "?") == 0);
 }
 
@@ -264,6 +330,7 @@ int main(void)
 {
     test_abi_and_registry();
     test_enumerate_open();
+    test_events();
     test_strings();
     printf("%d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? EXIT_FAILURE : EXIT_SUCCESS;

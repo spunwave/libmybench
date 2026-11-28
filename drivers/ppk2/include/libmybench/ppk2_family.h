@@ -25,7 +25,10 @@
  *     chosen, so a plain "start" measures; the current formula needs a voltage in both modes.
  *   - The supply mode and voltage cannot change while a stream runs (LMB_ERR_STATE): the
  *     current calculation takes the voltage at start. The output switch can.
+ *   - Current flows only while the DUT gate is on (PowerSupply output "DUT power"): with it off the
+ *     stream reads zero, in ammeter mode as well as in source mode.
  *   - Closing stops the stream and disconnects the DUT.
+ *   - The simulator also has the SimControl facet (load, pulsed load, lost samples, unplug, replug).
  */
 #ifndef LIBMYBENCH_PPK2_FAMILY_H
 #define LIBMYBENCH_PPK2_FAMILY_H
@@ -39,7 +42,10 @@ extern "C" {
 /** Register the family "ppk2" (hardware when the serial transport is built, and the simulator). */
 LMB_API int lmb_ppk2_register(lmb_context *ctx);
 
-/* Simulator controls, for tests and demos. LMB_ERR_INVALID_ARG unless dev is a simulated PPK2. */
+/* Simulator controls, for tests and demos. LMB_ERR_INVALID_ARG unless dev is a simulated PPK2.
+ * New code should use the generic SimControl facet (lmb_device_sim_control in facets.h), which a
+ * simulated device of any family can offer and which needs no family header: these three remain for
+ * compatibility and do the same. */
 
 /** Constant current drawn by the simulated DUT (default 1 mA). Takes effect at once. */
 LMB_API int lmb_ppk2_sim_set_load(lmb_device *dev, double amps);

@@ -29,6 +29,7 @@
 #define DEFAULT_MV 3300u
 #define FACETS (LMB_FACET_BIT(LMB_FACET_POWER_SUPPLY) | LMB_FACET_BIT(LMB_FACET_CURRENT_STREAM) | \
                 LMB_FACET_BIT(LMB_FACET_LOGIC_INPUT))
+#define SIM_RATE_HZ 100000.0 /* the simulated unit's sample rate */
 
 typedef struct entry {
     double current_a;
@@ -59,6 +60,7 @@ typedef struct p2dev {
     ppk2_stream *sstream;
     ppk2_cal scal;
     double load_a;
+    double pulse_peak_a, pulse_period_s, pulse_duty; /* a pulsed load when pulse_period_s > 0 */
     double last_t, carry;
 
     /* acquisition shared by the stream facets */
@@ -73,6 +75,7 @@ typedef struct p2dev {
     lmb_power_supply ps;
     lmb_current_stream cstream;
     lmb_logic_input linput;
+    lmb_sim_control sctrl; /* simulated units only */
 } p2dev;
 
 /* ---------------------------------------------------------------------------------------- */
@@ -119,8 +122,13 @@ static const ppk2_ctl *ctl_of(const p2dev *d)
 
 static double sim_current(void *user, uint64_t i)
 {
-    (void)i;
-    return ((const p2dev *)user)->load_a;
+    const p2dev *d = user;
+    if (d->pulse_period_s > 0.0) {
+        const double t = (double)i / SIM_RATE_HZ;
+        const double phase = fmod(t, d->pulse_period_s) / d->pulse_period_s;
+        return phase < d->pulse_duty ? d->pulse_peak_a : d->load_a;
+    }
+    return d->load_a;
 }
 
 static uint8_t sim_logic(void *user, uint64_t i)
@@ -570,6 +578,11 @@ static int dev_facet(void *drv, lmb_facet_kind kind, const void **out)
     case LMB_FACET_POWER_SUPPLY: *out = &d->ps; return LMB_OK;
     case LMB_FACET_CURRENT_STREAM: *out = &d->cstream; return LMB_OK;
     case LMB_FACET_LOGIC_INPUT: *out = &d->linput; return LMB_OK;
+    case LMB_FACET_SIM_CONTROL:
+        if (!d->sim)
+            return LMB_ERR_NO_FACET;
+        *out = &d->sctrl;
+        return LMB_OK;
     default: return LMB_ERR_NO_FACET;
     }
 }
@@ -581,6 +594,62 @@ static int dev_status(void *drv)
     const int rc = d->gone ? LMB_ERR_DISCONNECTED : LMB_OK;
     lmb_mutex_unlock(d->mu);
     return rc;
+}
+
+/* ---- simulator controls (the SimControl facet; the lmb_ppk2_sim_* functions below stay for compatibility) ---- */
+
+static int sc_set_load(void *self, double amps)
+{
+    p2dev *d = self;
+    if (!isfinite(amps) || amps < 0.0)
+        return LMB_ERR_INVALID_ARG;
+    lmb_mutex_lock(d->mu);
+    d->load_a = amps;
+    d->pulse_period_s = 0.0;
+    lmb_mutex_unlock(d->mu);
+    return LMB_OK;
+}
+
+static int sc_set_load_pulses(void *self, double base_a, double peak_a, double period_s, double duty)
+{
+    p2dev *d = self;
+    if (!isfinite(base_a) || !isfinite(peak_a) || base_a < 0.0 || peak_a < 0.0 || !isfinite(period_s) ||
+        period_s <= 0.0 || !isfinite(duty) || duty < 0.0 || duty > 1.0)
+        return LMB_ERR_INVALID_ARG;
+    lmb_mutex_lock(d->mu);
+    d->load_a = base_a;
+    d->pulse_peak_a = peak_a;
+    d->pulse_period_s = period_s;
+    d->pulse_duty = duty;
+    lmb_mutex_unlock(d->mu);
+    return LMB_OK;
+}
+
+static int sc_drop(void *self, uint64_t n)
+{
+    p2dev *d = self;
+    lmb_mutex_lock(d->mu);
+    ppk2_sim_drop(d->ssim, n);
+    lmb_mutex_unlock(d->mu);
+    return LMB_OK;
+}
+
+static int sc_disconnect(void *self)
+{
+    p2dev *d = self;
+    lmb_mutex_lock(d->mu);
+    d->gone = 1;
+    lmb_mutex_unlock(d->mu);
+    return LMB_OK;
+}
+
+static int sc_reconnect(void *self)
+{
+    p2dev *d = self;
+    lmb_mutex_lock(d->mu);
+    d->gone = 0;
+    lmb_mutex_unlock(d->mu);
+    return LMB_OK;
 }
 
 static p2dev *dev_new(void)
@@ -602,6 +671,8 @@ static p2dev *dev_new(void)
                                       cs_read, cs_stats};
     d->linput = (lmb_logic_input){LMB_ABI_VERSION, sizeof d->linput, d, li_info, li_start, li_stop,
                                   li_read, li_stats};
+    d->sctrl = (lmb_sim_control){LMB_ABI_VERSION, sizeof d->sctrl, d, sc_set_load, sc_drop, sc_disconnect,
+                                 sc_reconnect, sc_set_load_pulses};
     return d;
 }
 
@@ -638,7 +709,7 @@ static void sim_info(lmb_device_info *info, const char *id)
         snprintf(info->name, sizeof info->name, "Simulated PPK2 (%.30s)", id + sizeof SIM_ID);
     set_str(info->serial, sizeof info->serial, "SIM");
     set_str(info->transport, sizeof info->transport, "sim");
-    info->facets = FACETS;
+    info->facets = FACETS | LMB_FACET_BIT(LMB_FACET_SIM_CONTROL);
     info->simulated = 1;
 }
 
@@ -834,32 +905,17 @@ static p2dev *sim_of(lmb_device *dev)
 int lmb_ppk2_sim_set_load(lmb_device *dev, double amps)
 {
     p2dev *d = sim_of(dev);
-    if (!d || !isfinite(amps) || amps < 0.0)
-        return LMB_ERR_INVALID_ARG;
-    lmb_mutex_lock(d->mu);
-    d->load_a = amps;
-    lmb_mutex_unlock(d->mu);
-    return LMB_OK;
+    return d ? sc_set_load(d, amps) : LMB_ERR_INVALID_ARG;
 }
 
 int lmb_ppk2_sim_drop(lmb_device *dev, uint64_t n)
 {
     p2dev *d = sim_of(dev);
-    if (!d)
-        return LMB_ERR_INVALID_ARG;
-    lmb_mutex_lock(d->mu);
-    ppk2_sim_drop(d->ssim, n);
-    lmb_mutex_unlock(d->mu);
-    return LMB_OK;
+    return d ? sc_drop(d, n) : LMB_ERR_INVALID_ARG;
 }
 
 int lmb_ppk2_sim_disconnect(lmb_device *dev)
 {
     p2dev *d = sim_of(dev);
-    if (!d)
-        return LMB_ERR_INVALID_ARG;
-    lmb_mutex_lock(d->mu);
-    d->gone = 1;
-    lmb_mutex_unlock(d->mu);
-    return LMB_OK;
+    return d ? sc_disconnect(d) : LMB_ERR_INVALID_ARG;
 }

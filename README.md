@@ -16,10 +16,10 @@ MCP server, a web build, Python) and the device drivers. Each device family is o
 |---|---|---|
 | `core` (`libmybench::core`) | the device model | registry, enumeration, open/close, capability facets, error codes, ABI version: plain C ABI, see [docs/DEVICE-MODEL.md](docs/DEVICE-MODEL.md) |
 | `builtin` (`libmybench::builtin`) | | `lmb_register_builtin_families`: the families this build contains, so applications need no family-specific code |
-| `drivers/ppk2` (`libmybench::ppk2`) | Nordic Power Profiler Kit II | protocol core, simulator, device layer on the serial transport, `.ppk2` files (read and write), `ppk2-tool`; family of the device model (PowerSupply, CurrentStream, LogicInput, plus a simulated PPK2 `sim:ppk2`); tested end to end against the simulator, not yet on hardware |
+| `drivers/ppk2` (`libmybench::ppk2`) | Nordic Power Profiler Kit II | protocol core, simulator, device layer on the serial transport, `.ppk2` files (read and write), `ppk2-tool`; family of the device model (PowerSupply, CurrentStream, LogicInput, plus a simulated PPK2 `sim:ppk2` with the SimControl facet); tested end to end against the simulator, not yet on hardware |
 | `transports/serial` (`libmybench::serial`) | USB CDC and other serial ports | list ports with their USB ids and interface (Linux sysfs, macOS IOKit, Windows SetupAPI), open raw with DTR, timed reads, exclusive use (busy detection) |
 
-Planned: hot-plug (declared, not implemented), the `AnalogInput`, `AnalogOutput` and `DigitalIO` facets
+Hot-plug is polled (`lmb_poll_events`: arrived, left, status changed). Planned: the `AnalogInput`, `AnalogOutput` and `DigitalIO` facets
 (headers exist, shaped for the myDAQ, no driver yet), Counter and Dmm facets, Web Serial, the RP2
 component tester, the DSP moved out of the app, and more file formats. The design and order of work are in
 MYBENCH's `docs/design/driver-architecture-options.md`.
